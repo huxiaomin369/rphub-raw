@@ -10,8 +10,8 @@
     const DEFAULT_TTS_PRESET_VOICE = 'mimo_default';
     const DEFAULT_TTS_FORMAT = 'wav';
     const TTS_REQUEST_TIMEOUT_MS = 180000;
-    const MAX_SEGMENTS = 40;
-    const MAX_SEGMENT_LENGTH = 140;
+    const MAX_SEGMENTS = 50;
+    const MAX_SEGMENT_LENGTH = 200;
     const MAX_CONTEXT_MESSAGES = 10;
     const MAX_CACHE_ENTRIES = 24;
     const SYNTHESIS_CONCURRENCY = 3;
