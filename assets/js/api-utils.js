@@ -3,9 +3,15 @@
     const { extractApiErrorMessage, formatApiErrorMessage, getApiUsagePayload } = window.RPHubUtils;
     const { extractNativeReasoning, isNativeReasoningPart } = window.RPHubCardUtils;
     const buildApiEndpoint = (baseUrl, path) => {
-        const root = String(baseUrl || '').replace(/\/+$/, '');
+        // 先把 query/fragment 摘出来，否则带查询串的基址（如 Azure 的 ?api-version=）会把
+        // 追加的路径塞进查询串里，拼出 https://x/v1?k=1/v1/models 这种废地址。
+        const value = String(baseUrl || '');
+        const tailIndex = value.search(/[?#]/);
+        const head = tailIndex === -1 ? value : value.slice(0, tailIndex);
+        const tail = tailIndex === -1 ? '' : value.slice(tailIndex);
+        const root = head.replace(/\/+$/, '');
         const apiRoot = /\/v1$/i.test(root) ? root : `${root}/v1`;
-        return `${apiRoot}/${path}`;
+        return `${apiRoot}/${path}${tail}`;
     };
 
     const buildUserInputToolMessages = (text, callId) => [
@@ -25,11 +31,30 @@
         }
     ];
 
+    // 部分中转把响应整体包一层信封（如 { data: {...}, success: true }），
+    // 直接按 OpenAI 形状取 choices 会拿到 undefined，正文就变成空串。
+    // 只在「外层没有 choices、内层确实是 completion / 列表对象」时拆封，标准响应原样返回。
+    const unwrapApiEnvelope = (data) => {
+        if (!data || typeof data !== 'object' || Array.isArray(data) || data.choices) return data;
+        const inner = data.data;
+        if (!inner || typeof inner !== 'object' || Array.isArray(inner)) return data;
+        // choices 已覆盖 completion；列表则认 object 前缀或内层自带 data 数组，
+        // 免得把 { data: { object: 'user' } } 这类非列表对象误拆。
+        const isList = /^(list|embedding)/i.test(String(inner.object || '')) || Array.isArray(inner.data);
+        if (!inner.choices && !isList) return data;
+        // 用量可能被中转放在信封外层，拆封时要带上，否则记账会丢。
+        if (inner.usage || data.usage === undefined) return inner;
+        return { ...inner, usage: data.usage };
+    };
+
     const parsePayload = (text, status) => {
         const data = JSON.parse(text);
-        const error = extractApiErrorMessage(data, status);
+        // 内层只在确实带 error、且外层没明说成功时才当错误读，
+        // 避免把 data.message 这类正常字段、或成功响应里的软 error 字段误判成失败。
+        const error = extractApiErrorMessage(data, status)
+            || (data?.data?.error && data.success !== true ? extractApiErrorMessage(data.data, status) : '');
         if (error) throw new Error(error);
-        return data;
+        return unwrapApiEnvelope(data);
     };
     const readTextContent = value => Array.isArray(value)
         ? value.filter(part => !isNativeReasoningPart(part)).map(part => part?.text || part?.content || '').join('')

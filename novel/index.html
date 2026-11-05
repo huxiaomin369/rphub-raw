@@ -1231,6 +1231,17 @@
                 const selectedApiProvider = computed(() => (
                     apiProviders.value.find(provider => provider.id === settings.value.providerId) || null
                 ));
+                // RP-Hub 设置页的「模型列表地址」：仅当当前选中的供应商与 RP-Hub 侧一致时才沿用，
+                // 否则会拿 A 供应商的模型列表地址配 B 供应商的 Key。
+                const rphubModelListUrl = ref('');
+                const rphubModelListUrlProvider = ref('');
+                const resolveModelListUrl = () => {
+                    const custom = String(rphubModelListUrl.value || '').trim();
+                    const sameProvider = rphubModelListUrlProvider.value
+                        && rphubModelListUrlProvider.value === settings.value.providerId;
+                    if (!custom || !sameProvider) return buildApiEndpoint(settings.value.apiUrl, 'models');
+                    return custom;
+                };
 
                 // 计算属性
                 const totalWordCount = computed(() => chapters.value.reduce((acc, cur) => acc + (cur.wordCount || 0), 0));
@@ -2232,6 +2243,9 @@
                             rphubSettings.apiProviderKeys = { ...rphubSettings.apiProviderKeys,
                                 custom: rphubSettings.apiKey || rphubSettings.apiProviderKeys?.custom2 || '' };
                         }
+                        // 放在 custom2 归一化之后，否则供应商 id 对不上，自定义模型列表地址会永远失效
+                        rphubModelListUrl.value = String(rphubSettings.modelListUrl || '').trim();
+                        rphubModelListUrlProvider.value = rphubSettings.apiProviderId || '';
                         const providerKeys = rphubSettings.apiProviderKeys && typeof rphubSettings.apiProviderKeys === 'object'
                             ? rphubSettings.apiProviderKeys
                             : {};
@@ -2276,7 +2290,7 @@
                     isLoadingModels.value = true;
                     try {
                         const data = await window.RPHubApiClient.requestJson({
-                            url: buildApiEndpoint(settings.value.apiUrl, 'models'), apiKey: settings.value.apiKey
+                            url: resolveModelListUrl(), apiKey: settings.value.apiKey
                         });
                         if (data.data) {
                             availableModels.value = data.data.sort((a, b) => a.id.localeCompare(b.id));

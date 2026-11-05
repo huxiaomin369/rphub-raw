@@ -521,7 +521,27 @@
 
                                     <!-- Message Actions -->
                                     <div v-if="!msg.isEditing_Message && !isMessageThinkingOrRunning(msg) && !(index === chatHistory.length - 1 && !msg.isSelf && isGenerating) && !(msg.isSelf && isConversationBusy && !chatHistory.slice(index + 1).some(m => m.isSelf))"
-                                        :class="['message-action-bar absolute bottom-0 -mb-9 md:-mb-10 flex items-center transition-opacity duration-200', msg.isSelf ? 'right-0' : 'left-0', isStyleFilterDetailsOpen(msg, index) ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100']">
+                                        :class="['message-action-bar absolute bottom-0 -mb-9 md:-mb-10 flex items-center transition-opacity duration-200', msg.isSelf ? 'right-0' : 'left-0', (isStyleFilterDetailsOpen(msg, index) || isSpeakingMessage(msg, index)) ? 'opacity-100' : 'opacity-100 md:opacity-0 md:group-hover:opacity-100']">
+                                        <button v-if="canSpeakMessage(msg)" @click.stop="toggleSpeakMessage(index)"
+                                            class="message-action-button"
+                                            :class="{ 'is-speaking': isSpeakingMessage(msg, index) }"
+                                            :title="isSpeakingMessage(msg, index) ? '停止朗读' : '朗读'"
+                                            :aria-label="isSpeakingMessage(msg, index) ? '停止朗读' : '朗读'">
+                                            <svg v-if="isSpeakingMessage(msg, index)" class="w-3.5 h-3.5 md:w-4 md:h-4"
+                                                fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden="true">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M6 6h12v12H6z"></path>
+                                            </svg>
+                                            <svg v-else class="w-3.5 h-3.5 md:w-4 md:h-4" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24" aria-hidden="true">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M11 5L6 9H3v6h3l5 4V5z"></path>
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M15.54 8.46a5 5 0 010 7.07M18.36 5.64a9 9 0 010 12.73"></path>
+                                            </svg>
+                                        </button>
+                                        <span v-if="isSpeakingMessage(msg, index) && ttsState.stage" class="tts-action-status"
+                                            :title="ttsState.stage">{{ ttsState.stage }}</span>
                                         <button v-if="index === chatHistory.length - 1 && (msg.role === 'user' || chatHistory.slice(0, index).some(m => m.role === 'user'))"
                                             @click="regenerateMessage(index)"
                                             class="message-action-button"
@@ -1535,6 +1555,26 @@
                                         </div>
                                     </div>
                                     <div class="col-span-1 md:col-span-2">
+                                        <label class="settings-label">模型列表地址（留空用默认地址）</label>
+                                        <div class="relative group">
+                                            <div
+                                                class="absolute left-4 top-1/2 -translate-y-1/2 z-10 text-gray-400 group-focus-within:text-primary-500 transition-colors pointer-events-none">
+                                                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                        d="M13.828 10.172a4 4 0 010 5.656l-3 3a4 4 0 01-5.656-5.656l1.5-1.5m5.656-5.656l1.5-1.5a4 4 0 115.656 5.656l-3 3a4 4 0 01-5.656 0">
+                                                    </path>
+                                                </svg>
+                                            </div>
+                                            <input v-model="settings.modelListUrl" type="text"
+                                                class="settings-control settings-control--icon font-mono"
+                                                :placeholder="defaultModelListUrl"
+                                                spellcheck="false" autocomplete="off">
+                                        </div>
+                                        <p class="mt-1.5 text-[11px] leading-relaxed text-gray-400">
+                                            填写后按原样请求该地址，不做任何补全；请写完整地址（含 <span class="font-mono">/models</span>）。
+                                        </p>
+                                    </div>
+                                    <div class="col-span-1 md:col-span-2">
                                         <button @click="fetchModels(true)"
                                             class="settings-action w-full text-primary-600"
                                             title="刷新列表">
@@ -1623,6 +1663,137 @@
                                                 button-class="settings-control"
                                                 menu-class="text-sm">
                                             </custom-select>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <!-- Speech Synthesis Settings -->
+                                <div class="pt-6 border-t border-gray-100 mt-6">
+                                    <div class="mb-4 flex items-center justify-between gap-3">
+                                        <h4 class="settings-subheading flex items-center">
+                                            <svg class="w-4 h-4 mr-2 text-gray-500" fill="none" stroke="currentColor"
+                                                viewBox="0 0 24 24" aria-hidden="true">
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M11 5L6 9H3v6h3l5 4V5z"></path>
+                                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                    d="M15.54 8.46a5 5 0 010 7.07M18.36 5.64a9 9 0 010 12.73"></path>
+                                            </svg>
+                                            语音朗读
+                                        </h4>
+                                        <span class="text-xs text-gray-400 normal-case font-medium">LLM 音色设计 + MiMo-V2.5-TTS</span>
+                                    </div>
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                        <div class="min-w-0">
+                                            <label class="settings-label">MiMo 语音合成密钥</label>
+                                            <secret-input v-model="settings.ttsApiKey"
+                                                input-class="settings-control font-mono"
+                                                placeholder="MiMo API Key"></secret-input>
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">语音合成地址</label>
+                                            <input v-model="settings.ttsApiUrl" type="text"
+                                                class="settings-control font-mono"
+                                                placeholder="https://api.xiaomimimo.com/v1">
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">合成模型</label>
+                                            <input v-model="settings.ttsModel" type="text"
+                                                class="settings-control font-mono"
+                                                placeholder="mimo-v2.5-tts-voicedesign">
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">音色设计模型（留空用聊天模型）</label>
+                                            <input v-model="settings.ttsDesignModel" type="text"
+                                                class="settings-control font-mono"
+                                                placeholder="留空则复用聊天模型">
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">音色设计 API 地址（留空用主 API）</label>
+                                            <input v-model="settings.ttsDesignApiUrl" type="text"
+                                                class="settings-control font-mono"
+                                                placeholder="留空则复用主 API 地址">
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">音色设计 API Key（留空用主 Key）</label>
+                                            <secret-input v-model="settings.ttsDesignApiKey"
+                                                input-class="settings-control font-mono"
+                                                placeholder="留空则复用主 API Key"></secret-input>
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">音色设计上下文</label>
+                                            <custom-select v-model="settings.ttsContextRange" :options="ttsContextRangeOptions"
+                                                button-class="settings-control"
+                                                menu-class="text-sm">
+                                            </custom-select>
+                                        </div>
+
+                                        <div class="min-w-0">
+                                            <label class="settings-label">朗读速度</label>
+                                            <custom-select v-model="settings.ttsPlaybackRate" :options="ttsPlaybackRateOptions"
+                                                button-class="settings-control"
+                                                menu-class="text-sm">
+                                            </custom-select>
+                                        </div>
+
+                                        <div class="min-w-0 md:col-span-2">
+                                            <label class="settings-label">附加音色要求（可选）</label>
+                                            <textarea v-model="settings.ttsCustomInstruction" rows="2"
+                                                class="settings-control resize-y custom-scrollbar"
+                                                placeholder="例如：全部使用中文音色；旁白偏冷、语速偏慢；对白保留角色的口音特征"></textarea>
+                                        </div>
+                                    </div>
+
+                                    <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4">
+                                        <label class="settings-toggle-row group">
+                                            <span class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">显示朗读按钮</span>
+                                            <div class="relative inline-flex flex-none items-center">
+                                                <input type="checkbox" v-model="settings.ttsEnabled" class="settings-toggle-input sr-only">
+                                                <div class="settings-toggle"></div>
+                                            </div>
+                                        </label>
+                                        <label class="settings-toggle-row group">
+                                            <span class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">缓存已合成语音</span>
+                                            <div class="relative inline-flex flex-none items-center">
+                                                <input type="checkbox" v-model="settings.ttsCacheEnabled" class="settings-toggle-input sr-only">
+                                                <div class="settings-toggle"></div>
+                                            </div>
+                                        </label>
+                                    </div>
+
+                                    <div class="mt-3 flex items-center justify-between gap-3">
+                                        <span class="text-xs text-gray-400">{{ ttsState.stage || ('已缓存 ' + ttsCacheSize + ' 段语音') }}</span>
+                                        <div class="flex items-center gap-2">
+                                            <button type="button" @click="testTtsConnection()"
+                                                :disabled="ttsState.activeKey === '__tts_test__'"
+                                                class="settings-action text-primary-600"
+                                                :class="{ 'opacity-50 pointer-events-none': ttsState.activeKey === '__tts_test__' }"
+                                                title="用一段固定文本验证密钥、地址与网络连通性">
+                                                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                                                    aria-hidden="true">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                        d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z">
+                                                    </path>
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                        d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+                                                </svg>
+                                                测试语音合成
+                                            </button>
+                                            <button type="button" @click="clearTtsCache()" class="settings-action text-gray-500"
+                                                title="清空本次会话中缓存的合成语音">
+                                                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                                                    aria-hidden="true">
+                                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
+                                                        d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16">
+                                                    </path>
+                                                </svg>
+                                                清空语音缓存
+                                            </button>
                                         </div>
                                     </div>
                                 </div>
@@ -2558,7 +2729,7 @@
     <script>
         (function (stamp) {
             ['built-in-content', 'core-utils', 'api-utils', 'data-services', 'runtime-services', 'cloud-backup',
-                'update-check', 'ui-components', 'app'].forEach(name => {
+                'tts-service', 'update-check', 'ui-components', 'app'].forEach(name => {
                 document.write('<script src="assets/js/' + name + '.js?v=' + stamp + '"><\/script>');
             });
         })(Date.now());

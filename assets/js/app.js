@@ -124,6 +124,7 @@ const {
     unwrapForStorage
 } = window.RPHubStorage;
 const { prompts: BUILTIN_PROMPTS } = window.RPHubBuiltinContent;
+const { useSpeechSynthesis } = window.RPHubTts;
 const {
     activeTools: activeToolConfig,
     apiProviderOptions,
@@ -566,6 +567,8 @@ const app = createApp({
             apiProviderId: DEFAULT_API_PROVIDER_ID,
             apiProviderKeys: {},
             customApiUrl: '',
+            // 留空则用 {apiUrl}/v1/models，填写后原样请求该地址（不补全）
+            modelListUrl: '',
             model: DEFAULT_API_CONFIG.qualityModel,
             contextSize: MAX_CONTEXT_SIZE,
             temperature: 1.0,
@@ -593,7 +596,20 @@ const app = createApp({
             qualityModel: DEFAULT_API_CONFIG.qualityModel,
             balancedModel: DEFAULT_API_CONFIG.balancedModel,
             fastModel: DEFAULT_API_CONFIG.fastModel,
-            visionModel: ''
+            visionModel: '',
+
+            // 语音朗读：LLM 先做旁白/对白音色设计，再交给 MiMo-V2.5-TTS 合成
+            ttsEnabled: true,
+            ttsApiUrl: 'https://api.xiaomimimo.com/v1',
+            ttsApiKey: '',
+            ttsModel: 'mimo-v2.5-tts-voicedesign',
+            ttsDesignApiUrl: '',
+            ttsDesignApiKey: '',
+            ttsDesignModel: '',
+            ttsContextRange: 4,
+            ttsPlaybackRate: 1,
+            ttsCacheEnabled: true,
+            ttsCustomInstruction: ''
         });
         const v5UnsupportedImageStyles = new Set(['r18', 'lolita25d', 'anime']);
         const availableImageStyleOptions = computed(() => settings.imageModel === 'nai-diffusion-5-full'
@@ -812,7 +828,8 @@ const app = createApp({
                         apiProviderId: settings.apiProviderId,
                         apiProviderKeys: JSON.parse(JSON.stringify(settings.apiProviderKeys)),
                         apiKey: settings.apiKey,
-                        customApiUrl: settings.customApiUrl
+                        customApiUrl: settings.customApiUrl,
+                        modelListUrl: settings.modelListUrl
                     },
                     providers
                 }, '*');
@@ -3368,6 +3385,13 @@ const app = createApp({
         };
 
         // API & Models
+        // 模型列表地址：留空时用默认的 {apiUrl}/v1/models；填写后原样请求该地址，不做任何补全。
+        const resolveModelListUrl = () => {
+            const custom = String(settings.modelListUrl || '').trim();
+            return custom || buildApiEndpoint(settings.apiUrl, 'models');
+        };
+        const defaultModelListUrl = computed(() => buildApiEndpoint(settings.apiUrl, 'models'));
+
         const fetchModels = async (isManual = false) => {
             const apiKey = String(settings.apiKey || '').trim();
             if (!apiKey) {
@@ -3376,7 +3400,7 @@ const app = createApp({
             }
             try {
                 if (isManual) showToast('正在获取模型列表...', 'info');
-                const url = buildApiEndpoint(settings.apiUrl, 'models');
+                const url = resolveModelListUrl();
                 const data = await requestJson({ url, apiKey });
                 availableModels.value = data.data || [];
                 if (isManual) showToast(`成功获取 ${availableModels.value.length} 个模型`, 'success');
@@ -3461,7 +3485,7 @@ const app = createApp({
                 return;
             }
             await checkConnectionStatus(apiStatus, apiLatency, 'API', signal => (
-                requestJson({ url: buildApiEndpoint(settings.apiUrl, 'models'), apiKey: settings.apiKey, signal })
+                requestJson({ url: resolveModelListUrl(), apiKey: settings.apiKey, signal })
             ));
         };
 
@@ -8245,6 +8269,39 @@ const app = createApp({
             if (thirdPersonPreset) thirdPersonPreset.enabled = user.person === 'third';
         };
 
+        // 语音朗读：点击气泡下方的小喇叭，先由 LLM 按旁白/对白设计音色，再逐段合成播放。
+        const ttsContextRangeOptions = Object.freeze([0, 2, 4, 6, 8, 10].map(value => ({
+            value,
+            label: value === 0 ? '不带上下文' : `前后 ${value} 条`
+        })));
+        const ttsPlaybackRateOptions = Object.freeze([0.75, 1, 1.25, 1.5, 2].map(value => ({
+            value,
+            label: `${value}x`
+        })));
+        const {
+            ttsState,
+            ttsCacheSize,
+            canSpeakMessage,
+            isSpeakingMessage,
+            speakMessage,
+            stopSpeaking,
+            toggleSpeakMessage,
+            testTtsConnection,
+            clearTtsCache
+        } = useSpeechSynthesis({
+            settings,
+            showToast: (...args) => showToast(...args),
+            requestChatCompletion: options => requestTrackedChatCompletion(options, 'tts'),
+            buildApiEndpoint,
+            getChatHistory: () => chatHistory.value,
+            getCurrentCharacter: () => currentCharacter.value,
+            getUser: () => user,
+            // 与气泡显示保持一致：先剥 CoT/UI 模板块/记忆引用，再把 {{user}} 换成用户昵称。
+            resolveMessageText: content => replaceUserNamePlaceholder(stripMemoryCitations(
+                stripUiTemplateUpdateBlock(parseCot(content || '').main)
+            ))
+        });
+
         return {
             switchProfile, createNewProfile, deleteProfile, userProfiles, activeProfileId, showProfileDropdown,
             processMainContent, replaceUserNamePlaceholder,
@@ -8307,9 +8364,11 @@ const app = createApp({
                 });
             },
             toggleNavigation, closeNavigation,
-            fetchModels, selectModel, selectQuickModels, sendMessage, autoResizeInput, handleChatInputFocus, handleChatInputBlur, stopGeneration, clearChat, toggleChatFullscreen,
+            fetchModels, defaultModelListUrl, selectModel, selectQuickModels, sendMessage, autoResizeInput, handleChatInputFocus, handleChatInputBlur, stopGeneration, clearChat, toggleChatFullscreen,
             handleConfirm, handleCancel, // Export handlers
             copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
+            ttsState, ttsCacheSize, canSpeakMessage, isSpeakingMessage, speakMessage, stopSpeaking, toggleSpeakMessage, testTtsConnection, clearTtsCache,
+            ttsContextRangeOptions, ttsPlaybackRateOptions,
             editMessage, saveEditMessage, cancelEditMessage,
             createNewCharacter, editCharacter, saveCharacter, deleteCharacter, selectCharacter, toggleCharacterFavorite, isCharacterFavorite,
             currentUiTemplates, activeUiTemplates, uiTemplateUpdateStatus, createUiTemplate, editUiTemplate, saveUiTemplate, deleteUiTemplate, importUiTemplates, updateUiTemplatesFromChat, renderEditingUiTemplatePreview, handleUiTemplateClick,
