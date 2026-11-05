@@ -1680,7 +1680,7 @@
                                             </svg>
                                             语音朗读
                                         </h4>
-                                        <span class="text-xs text-gray-400 normal-case font-medium">LLM 音色设计 + MiMo-V2.5-TTS</span>
+                                        <span class="text-xs text-gray-400 normal-case font-medium">{{ ttsModeBadgeLabel }}</span>
                                     </div>
                                     <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
                                         <div class="min-w-0">
@@ -1697,41 +1697,76 @@
                                                 placeholder="https://api.xiaomimimo.com/v1">
                                         </div>
 
-                                        <div class="min-w-0">
-                                            <label class="settings-label">合成模型</label>
-                                            <input v-model="settings.ttsModel" type="text"
-                                                class="settings-control font-mono"
-                                                placeholder="mimo-v2.5-tts-voicedesign">
-                                        </div>
-
-                                        <div class="min-w-0">
-                                            <label class="settings-label">音色设计模型（留空用聊天模型）</label>
-                                            <input v-model="settings.ttsDesignModel" type="text"
-                                                class="settings-control font-mono"
-                                                placeholder="留空则复用聊天模型">
-                                        </div>
-
-                                        <div class="min-w-0">
-                                            <label class="settings-label">音色设计 API 地址（留空用主 API）</label>
-                                            <input v-model="settings.ttsDesignApiUrl" type="text"
-                                                class="settings-control font-mono"
-                                                placeholder="留空则复用主 API 地址">
-                                        </div>
-
-                                        <div class="min-w-0">
-                                            <label class="settings-label">音色设计 API Key（留空用主 Key）</label>
-                                            <secret-input v-model="settings.ttsDesignApiKey"
-                                                input-class="settings-control font-mono"
-                                                placeholder="留空则复用主 API Key"></secret-input>
-                                        </div>
-
-                                        <div class="min-w-0">
-                                            <label class="settings-label">音色设计上下文</label>
-                                            <custom-select v-model="settings.ttsContextRange" :options="ttsContextRangeOptions"
+                                        <div class="min-w-0 md:col-span-2">
+                                            <label class="settings-label">朗读方式</label>
+                                            <custom-select v-model="settings.ttsMode" :options="ttsModeOptions"
                                                 button-class="settings-control"
                                                 menu-class="text-sm">
                                             </custom-select>
                                         </div>
+
+                                        <!-- 预置音色整段朗读：mimo-v2.5-tts 直接用预置音色把整条气泡读出来，不经过 LLM -->
+                                        <template v-if="isTtsPresetMode">
+                                            <div class="min-w-0">
+                                                <label class="settings-label">预置音色</label>
+                                                <custom-select v-model="settings.ttsVoice" :options="ttsPresetVoiceOptions"
+                                                    button-class="settings-control"
+                                                    menu-class="text-sm">
+                                                </custom-select>
+                                            </div>
+
+                                            <div class="min-w-0">
+                                                <label class="settings-label">合成模型</label>
+                                                <input v-model="settings.ttsPresetModel" type="text"
+                                                    class="settings-control font-mono"
+                                                    placeholder="mimo-v2.5-tts">
+                                            </div>
+
+                                            <div class="min-w-0 md:col-span-2">
+                                                <label class="settings-label">发音风格标签（可选）</label>
+                                                <input v-model="settings.ttsPresetStyle" type="text"
+                                                    class="settings-control"
+                                                    placeholder="如 温柔 / 东北话 / 唱歌，留空用默认读法">
+                                            </div>
+
+                                            <div class="min-w-0 md:col-span-2">
+                                                <label class="settings-label">整段朗读指令（可选）</label>
+                                                <textarea v-model="settings.ttsPresetInstruction" rows="2"
+                                                    class="settings-control resize-y custom-scrollbar"
+                                                    placeholder="用自然语言描述语气与节奏，例如：语速偏慢，语气温柔克制，句尾轻微气声"></textarea>
+                                            </div>
+                                        </template>
+
+                                        <!-- LLM 音色设计：旁白/对白分别定制音色后逐段合成（原有能力，保留） -->
+                                        <template v-else>
+                                            <div class="min-w-0">
+                                                <label class="settings-label">合成模型</label>
+                                                <input v-model="settings.ttsModel" type="text"
+                                                    class="settings-control font-mono"
+                                                    placeholder="mimo-v2.5-tts-voicedesign">
+                                            </div>
+
+                                            <div class="min-w-0">
+                                                <label class="settings-label">音色设计模型（留空用聊天模型）</label>
+                                                <input v-model="settings.ttsDesignModel" type="text"
+                                                    class="settings-control font-mono"
+                                                    placeholder="留空则复用聊天模型">
+                                            </div>
+
+                                            <div class="min-w-0">
+                                                <label class="settings-label">音色设计 API 地址（留空用主 API）</label>
+                                                <input v-model="settings.ttsDesignApiUrl" type="text"
+                                                    class="settings-control font-mono"
+                                                    placeholder="留空则复用主 API 地址">
+                                            </div>
+
+                                            <div class="min-w-0">
+                                                <label class="settings-label">音色设计 API Key（留空用主 Key）</label>
+                                                <secret-input v-model="settings.ttsDesignApiKey"
+                                                    input-class="settings-control font-mono"
+                                                    placeholder="留空则复用主 API Key"></secret-input>
+                                            </div>
+                                        </template>
 
                                         <div class="min-w-0">
                                             <label class="settings-label">朗读速度</label>
@@ -1741,7 +1776,15 @@
                                             </custom-select>
                                         </div>
 
-                                        <div class="min-w-0 md:col-span-2">
+                                        <div v-if="!isTtsPresetMode" class="min-w-0">
+                                            <label class="settings-label">音色设计上下文</label>
+                                            <custom-select v-model="settings.ttsContextRange" :options="ttsContextRangeOptions"
+                                                button-class="settings-control"
+                                                menu-class="text-sm">
+                                            </custom-select>
+                                        </div>
+
+                                        <div v-if="!isTtsPresetMode" class="min-w-0 md:col-span-2">
                                             <label class="settings-label">附加音色要求（可选）</label>
                                             <textarea v-model="settings.ttsCustomInstruction" rows="2"
                                                 class="settings-control resize-y custom-scrollbar"
@@ -1761,6 +1804,13 @@
                                             <span class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">缓存已合成语音</span>
                                             <div class="relative inline-flex flex-none items-center">
                                                 <input type="checkbox" v-model="settings.ttsCacheEnabled" class="settings-toggle-input sr-only">
+                                                <div class="settings-toggle"></div>
+                                            </div>
+                                        </label>
+                                        <label v-if="isTtsPresetMode" class="settings-toggle-row group">
+                                            <span class="text-sm font-medium text-gray-600 group-hover:text-gray-900 transition-colors">流式合成（边生成边收，首句更快）</span>
+                                            <div class="relative inline-flex flex-none items-center">
+                                                <input type="checkbox" v-model="settings.ttsPresetStream" class="settings-toggle-input sr-only">
                                                 <div class="settings-toggle"></div>
                                             </div>
                                         </label>

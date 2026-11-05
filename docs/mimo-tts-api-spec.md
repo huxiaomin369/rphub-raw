@@ -759,4 +759,52 @@ curl --location --request POST 'https://api.xiaomimimo.com/v1/chat/completions' 
 
 ---
 
+## 12. RP-Hub 气泡朗读集成（实现说明）
+
+实现位置：`assets/js/tts-service.js`（服务层）、`assets/js/app.js`（设置默认值与接线）、`index.html`（设置面板）。同一个气泡小喇叭入口下有两种「朗读方式」，在设置页「语音朗读 → 朗读方式」切换。
+
+### 12.1 两种方式
+
+| 朗读方式 | `settings.ttsMode` | 合成模型 | 是否经过 LLM | 文本切分 |
+| --- | --- | --- | --- | --- |
+| LLM 音色设计（原有能力） | `voicedesign` | `mimo-v2.5-tts-voicedesign` | 是：先由聊天模型输出旁白/对白分镜与音色描述 JSON | 按说话人切分，单段 ≤ 140 字，最多 40 段 |
+| 预置音色整段朗读（新增） | `preset` | `mimo-v2.5-tts` | 否 | 不做角色切分，仅按长度切块，单块 ≤ 600 字 |
+
+两种方式共用：小喇叭按钮与播放状态（`ttsState`）、缓存（`MAX_CACHE_ENTRIES = 24`）、播放速度、`AbortController` 取消链路、以及「测试语音合成」自检。
+
+### 12.2 预置音色模式的请求体
+
+```json
+{
+    "model": "mimo-v2.5-tts",
+    "messages": [
+        { "role": "user", "content": "<整段朗读指令；留空时用中性朗读指令兜底>" },
+        { "role": "assistant", "content": "(<发音风格标签>)<气泡正文>" }
+    ],
+    "audio": { "format": "wav", "voice": "<预置音色 Voice ID>" }
+}
+```
+
+- 正文放在 `assistant`，符合官方「目标文本不可放在 `user` 消息内」的硬性要求；`user` 只承载风格指令。
+- 发音风格标签走「音频标签控制」，紧贴正文开头写作 `(温柔)正文`；设置页允许输入 `温柔`、`（温柔）`、`[温柔]` 等写法，写入前统一归一化为半角圆括号形态。留空则不加标签。
+- `audio.voice` 取设置里的预置音色，可选值即官方预置音色表（`mimo_default` / 冰糖 / 茉莉 / 苏打 / 白桦 / Mia / Chloe / Milo / Dean）。
+
+### 12.3 流式合成
+
+开启「流式合成」后请求追加 `"stream": true`，并把 `audio.format` 换成 `pcm16`（官方要求：流式必须用 `pcm16`）。响应按 SSE 逐行解析 `choices[0].delta.audio.data` 的 base64 分片，累积后按 **24kHz / 16bit / 单声道** 拼接，本地补 44 字节 WAV 头再交给 `<audio>` 播放。关闭时走非流式 `wav`，直接使用响应中的 `choices[0].message.audio.data`。
+
+### 12.4 切块与缓存
+
+- 切块只切不改：优先按空行分段，超长段落再按句末标点断句，仍超长才按 600 字硬切；播放严格按原文顺序。切块结果与 voicedesign 一样受 40 段上限约束，被截断时才会提示「只朗读前 40 段」。
+- 缓存键包含「朗读方式 + 合成地址 + 模型 + 音色 + 风格标签 + 指令 + 流式开关 + 消息键 + 文本指纹」（voicedesign 一侧为「合成地址 + 合成模型 + 音色设计模型/地址 + 音色设计上下文 + 附加要求」），因此换音色、换上下文或换模式后都不会命中上一套音频；密钥不参与缓存键。
+- 旧存档没有 `ttsMode` 时回落为 `voicedesign`，即升级后默认行为与升级前一致；`ttsVoice`、`ttsPresetStream` 等新键在加载时也会归一化，避免存档里的 `null` / 字符串污染设置页回显。
+
+### 12.5 已知边界
+
+- 预置音色模式的 `user` 消息指令属于官方「自然语言风格控制」，与 `voicedesign` 的音色描述语义不同：前者只调语气/节奏，不改音色（音色由 `audio.voice` 决定）。
+- 官方未给出合成文本的字数上限（见第 10 节 #12），因此单块长度取 600 字作为经验值，超出即切块。
+- `mimo-v2.5-tts` 不支持音色设计与音色克隆；需要定制音色时仍应使用 `voicedesign` 方式。
+
+---
+
 *本文档由官方文档原文取证整理，字段定义以 [#2 API 参考页](https://mimo.mi.com/docs/zh-CN/api/audio/tts-post) 为权威来源，使用规则以 [#1 指南页](https://mimo.mi.com/docs/zh-CN/quick-start/usage-guide/audio/speech-synthesis-v2.5) 为权威来源。*

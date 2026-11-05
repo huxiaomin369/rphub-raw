@@ -124,7 +124,16 @@ const {
     unwrapForStorage
 } = window.RPHubStorage;
 const { prompts: BUILTIN_PROMPTS } = window.RPHubBuiltinContent;
-const { useSpeechSynthesis } = window.RPHubTts;
+const {
+    useSpeechSynthesis,
+    TTS_MODE_OPTIONS,
+    PRESET_VOICE_OPTIONS,
+    TTS_MODE_PRESET,
+    DEFAULT_TTS_MODEL,
+    DEFAULT_TTS_PRESET_MODEL,
+    normalizeTtsMode: normalizeTtsModeSetting,
+    normalizePresetVoice: normalizePresetVoiceSetting
+} = window.RPHubTts;
 const {
     activeTools: activeToolConfig,
     apiProviderOptions,
@@ -598,11 +607,17 @@ const app = createApp({
             fastModel: DEFAULT_API_CONFIG.fastModel,
             visionModel: '',
 
-            // 语音朗读：LLM 先做旁白/对白音色设计，再交给 MiMo-V2.5-TTS 合成
+            // 语音朗读：voicedesign = LLM 先做旁白/对白音色设计再逐段合成；preset = 用 mimo-v2.5-tts 预置音色整条气泡朗读
             ttsEnabled: true,
+            ttsMode: 'voicedesign',
             ttsApiUrl: 'https://api.xiaomimimo.com/v1',
             ttsApiKey: '',
             ttsModel: 'mimo-v2.5-tts-voicedesign',
+            ttsPresetModel: 'mimo-v2.5-tts',
+            ttsVoice: 'mimo_default',
+            ttsPresetStyle: '',
+            ttsPresetInstruction: '',
+            ttsPresetStream: false,
             ttsDesignApiUrl: '',
             ttsDesignApiKey: '',
             ttsDesignModel: '',
@@ -1779,6 +1794,14 @@ const app = createApp({
                     settings.imageSize = legacySize.includes('横') ? '横图' : legacySize.includes('方') ? '方图' : '竖图';
                 }
                 settings.imageGenCount = Math.min(8, Math.max(2, Math.round(Number(settings.imageGenCount) || 2)));
+                // 旧存档没有 ttsMode，或写入了非法值，一律回到 voicedesign，保持原有朗读行为。
+                settings.ttsMode = normalizeTtsModeSetting(settings.ttsMode);
+                // 预置音色模式的几项也做一次归一化，避免存档里的 null / 字符串污染设置页回显与请求参数。
+                settings.ttsPresetModel = String(settings.ttsPresetModel || '').trim() || DEFAULT_TTS_PRESET_MODEL;
+                settings.ttsVoice = normalizePresetVoiceSetting(settings.ttsVoice);
+                settings.ttsPresetStyle = String(settings.ttsPresetStyle == null ? '' : settings.ttsPresetStyle);
+                settings.ttsPresetInstruction = String(settings.ttsPresetInstruction == null ? '' : settings.ttsPresetInstruction);
+                settings.ttsPresetStream = settings.ttsPresetStream === true;
                 // Fonts are chosen per context now; drop the retired global font setting.
                 delete settings.fontFamily;
                 delete settings.fontFamilyVersion;
@@ -8269,7 +8292,8 @@ const app = createApp({
             if (thirdPersonPreset) thirdPersonPreset.enabled = user.person === 'third';
         };
 
-        // 语音朗读：点击气泡下方的小喇叭，先由 LLM 按旁白/对白设计音色，再逐段合成播放。
+        // 语音朗读：两种方式共用同一个小喇叭入口。
+        // voicedesign = 先由 LLM 按旁白/对白设计音色再逐段合成；preset = 直接用 mimo-v2.5-tts 预置音色把整条气泡读出来。
         const ttsContextRangeOptions = Object.freeze([0, 2, 4, 6, 8, 10].map(value => ({
             value,
             label: value === 0 ? '不带上下文' : `前后 ${value} 条`
@@ -8278,6 +8302,23 @@ const app = createApp({
             value,
             label: `${value}x`
         })));
+        const ttsModeOptions = TTS_MODE_OPTIONS;
+        // 存档里若留着清单外的音色 ID（例如手改过设置），把它作为一个自定义项补进下拉，避免「显示请选择但实际在用」。
+        const ttsPresetVoiceOptions = computed(() => {
+            const current = normalizePresetVoiceSetting(settings.ttsVoice);
+            if (PRESET_VOICE_OPTIONS.some(option => option.value === current)) return PRESET_VOICE_OPTIONS;
+            return [...PRESET_VOICE_OPTIONS, { value: current, label: `${current}（自定义）` }];
+        });
+        const isTtsPresetMode = computed(() => normalizeTtsModeSetting(settings.ttsMode) === TTS_MODE_PRESET);
+        // 徽标跟着实际配置的模型走，避免改了模型名后徽标仍显示默认值。
+        const ttsModeBadgeLabel = computed(() => {
+            if (isTtsPresetMode.value) {
+                const model = String(settings.ttsPresetModel || '').trim() || DEFAULT_TTS_PRESET_MODEL;
+                return `${model} 预置音色 · 整条气泡朗读`;
+            }
+            const model = String(settings.ttsModel || '').trim() || DEFAULT_TTS_MODEL;
+            return `LLM 音色设计 + ${model}`;
+        });
         const {
             ttsState,
             ttsCacheSize,
@@ -8368,7 +8409,7 @@ const app = createApp({
             handleConfirm, handleCancel, // Export handlers
             copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
             ttsState, ttsCacheSize, canSpeakMessage, isSpeakingMessage, speakMessage, stopSpeaking, toggleSpeakMessage, testTtsConnection, clearTtsCache,
-            ttsContextRangeOptions, ttsPlaybackRateOptions,
+            ttsContextRangeOptions, ttsPlaybackRateOptions, ttsModeOptions, ttsPresetVoiceOptions, isTtsPresetMode, ttsModeBadgeLabel,
             editMessage, saveEditMessage, cancelEditMessage,
             createNewCharacter, editCharacter, saveCharacter, deleteCharacter, selectCharacter, toggleCharacterFavorite, isCharacterFavorite,
             currentUiTemplates, activeUiTemplates, uiTemplateUpdateStatus, createUiTemplate, editUiTemplate, saveUiTemplate, deleteUiTemplate, importUiTemplates, updateUiTemplatesFromChat, renderEditingUiTemplatePreview, handleUiTemplateClick,

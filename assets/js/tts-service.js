@@ -1,9 +1,13 @@
-// 聊天气泡语音朗读：LLM 音色设计（旁白/对白）+ MiMo-V2.5-TTS 文本音色设计合成。
+// 聊天气泡语音朗读：两种朗读方式共用同一套合成/缓存/播放链路。
+// - voicedesign：LLM 先按旁白与对白做音色设计，再交给 mimo-v2.5-tts-voicedesign 逐段合成（音色定制朗读）。
+// - preset：直接用 mimo-v2.5-tts 的预置音色，把整条气泡文本一口气读出来，不经过 LLM。
 (function () {
     const { reactive, ref } = Vue;
 
     const DEFAULT_TTS_BASE_URL = 'https://api.xiaomimimo.com/v1';
     const DEFAULT_TTS_MODEL = 'mimo-v2.5-tts-voicedesign';
+    const DEFAULT_TTS_PRESET_MODEL = 'mimo-v2.5-tts';
+    const DEFAULT_TTS_PRESET_VOICE = 'mimo_default';
     const DEFAULT_TTS_FORMAT = 'wav';
     const TTS_REQUEST_TIMEOUT_MS = 180000;
     const MAX_SEGMENTS = 40;
@@ -12,6 +16,30 @@
     const MAX_CACHE_ENTRIES = 24;
     const SYNTHESIS_CONCURRENCY = 3;
     const CONTEXT_EXCERPT_LENGTH = 220;
+    // 预置音色整段朗读：不做角色切分，只按长度上限切块，单块上限放宽到一整段气泡的量级。
+    const MAX_PRESET_CHUNK_LENGTH = 600;
+    // 流式返回的裸流固定是 24kHz PCM16LE 单声道。
+    const TTS_PCM_SAMPLE_RATE = 24000;
+    const TTS_MODE_VOICEDESIGN = 'voicedesign';
+    const TTS_MODE_PRESET = 'preset';
+    const TTS_MODE_OPTIONS = Object.freeze([
+        { value: TTS_MODE_VOICEDESIGN, label: 'LLM 音色设计（分角色逐段）' },
+        { value: TTS_MODE_PRESET, label: '预置音色整段朗读（mimo-v2.5-tts）' }
+    ]);
+    // 预置音色清单来自官方文档「使用预置音色进行语音合成」的 Voice ID 表。
+    const PRESET_VOICE_OPTIONS = Object.freeze([
+        { value: 'mimo_default', label: 'MiMo-默认（中国集群=冰糖）' },
+        { value: '冰糖', label: '冰糖 · 中文女声' },
+        { value: '茉莉', label: '茉莉 · 中文女声' },
+        { value: '苏打', label: '苏打 · 中文男声' },
+        { value: '白桦', label: '白桦 · 中文男声' },
+        { value: 'Mia', label: 'Mia · 英文女声' },
+        { value: 'Chloe', label: 'Chloe · 英文女声' },
+        { value: 'Milo', label: 'Milo · 英文男声' },
+        { value: 'Dean', label: 'Dean · 英文男声' }
+    ]);
+    // 预置音色模式下 user 消息只是风格指令（内容不会被念出来），留空时用这条中性指令兜底。
+    const DEFAULT_PRESET_INSTRUCTION = '自然地朗读这段文本，吐字清晰，语速适中，只读原文，不要增删内容。';
 
     // 音色设计环节的破甲约束：确保模型对成人向虚构内容不做拒绝、不说教、不降级处理。
     const UNRESTRICTED_INJECTION = [
@@ -120,6 +148,98 @@
         return text.length > length ? text.slice(0, length) + '…' : text;
     };
 
+    const normalizeTtsMode = (value) => (String(value == null ? '' : value).trim() === TTS_MODE_PRESET
+        ? TTS_MODE_PRESET : TTS_MODE_VOICEDESIGN);
+
+    const normalizePresetVoice = (value) => {
+        const voice = String(value == null ? '' : value).trim();
+        return voice || DEFAULT_TTS_PRESET_VOICE;
+    };
+
+    const presetVoiceLabel = (value) => {
+        const voice = normalizePresetVoice(value);
+        const matched = PRESET_VOICE_OPTIONS.find(option => option.value === voice);
+        return matched ? matched.label : voice;
+    };
+
+    // 发音风格走「音频标签控制」，标签必须紧贴正文最开头：`(温柔)正文`。这里只取标签内容，括号由 applyStyleTag 补。
+    const normalizeStyleTag = (value) => String(value == null ? '' : value)
+        .trim().replace(/^[([（【]+/, '').replace(/[)\]）】]+$/, '').trim();
+
+    const applyStyleTag = (text, styleTag) => {
+        const body = String(text == null ? '' : text);
+        const tag = normalizeStyleTag(styleTag);
+        return tag && body ? `(${tag})${body}` : body;
+    };
+
+    // 硬切兜底：优先在末段空白处断开，避免把英文单词切成两半（中文无词边界，按上限切即可）。
+    const hardWrapSpeechText = (text, limit) => {
+        const pieces = [];
+        let rest = String(text == null ? '' : text);
+        while (rest.length > limit) {
+            const window = Math.max(1, Math.floor(limit * 0.2));
+            const head = rest.slice(0, limit);
+            const breakAt = Math.max(head.lastIndexOf(' '), head.lastIndexOf('\t'));
+            const cut = breakAt >= limit - window ? breakAt + 1 : limit;
+            pieces.push(rest.slice(0, cut).trim());
+            rest = rest.slice(cut).trimStart();
+        }
+        if (rest.trim()) pieces.push(rest.trim());
+        return pieces.filter(Boolean);
+    };
+
+    const splitOversizeBlock = (block, limit) => {
+        const pieces = [];
+        let buffer = '';
+        // 先按句末标点断句：中英文标点都算，且保留标点与原文词间空白（拼接时原样还原）。
+        // 断不开的超长句再交给 hardWrapSpeechText 按长度切。
+        const sentences = block.match(/[^。！？!?…；;.\n]+[。！？!?…；;.]*|\n/g) || [block];
+        const flush = () => {
+            const value = buffer.trim();
+            if (value) pieces.push(value);
+            buffer = '';
+        };
+        for (const sentence of sentences) {
+            if (sentence === '\n') { flush(); continue; }
+            if (!sentence.trim()) continue;
+            if (sentence.length > limit) {
+                flush();
+                for (const piece of hardWrapSpeechText(sentence.trim(), limit)) pieces.push(piece);
+                continue;
+            }
+            if (!buffer) buffer = sentence;
+            else if (buffer.length + sentence.length <= limit) buffer += sentence;
+            else { flush(); buffer = sentence; }
+        }
+        flush();
+        return pieces.filter(Boolean);
+    };
+
+    // 预置音色朗读整条气泡：不做角色切分，只保证单块不超过上限；播放顺序仍是原文顺序。
+    const splitForPresetSpeech = (text, maxLength = MAX_PRESET_CHUNK_LENGTH) => {
+        const limit = Math.max(40, Number(maxLength) || MAX_PRESET_CHUNK_LENGTH);
+        const source = String(text == null ? '' : text).trim();
+        if (!source) return [];
+        if (source.length <= limit) return [source];
+        const chunks = [];
+        let buffer = '';
+        const flush = () => { if (buffer) { chunks.push(buffer); buffer = ''; } };
+        for (const paragraph of source.split(/\n{2,}/)) {
+            const block = paragraph.trim();
+            if (!block) continue;
+            if (block.length > limit) {
+                flush();
+                for (const piece of splitOversizeBlock(block, limit)) chunks.push(piece);
+                continue;
+            }
+            if (!buffer) buffer = block;
+            else if (buffer.length + 1 + block.length <= limit) buffer = `${buffer}\n${block}`;
+            else { flush(); buffer = block; }
+        }
+        flush();
+        return chunks;
+    };
+
     // 取第一个「括号配平」的完整对象，避免模型在 JSON 前后各写一段花括号时整体解析失败。
     const findJsonSpan = (text) => {
         const start = text.indexOf('{');
@@ -200,8 +320,10 @@
                 delivery: ''
             });
         }
-        if (segments.length > MAX_SEGMENTS) segments.length = MAX_SEGMENTS;
-        return { sceneTone: String(payload?.sceneTone || '').trim(), segments };
+        // 先记下是否真的超出上限，再截断：段数判定必须与截断口径一致，否则恰好等于上限时会误报「只读前 N 段」。
+        const truncated = segments.length > MAX_SEGMENTS;
+        if (truncated) segments.length = MAX_SEGMENTS;
+        return { sceneTone: String(payload?.sceneTone || '').trim(), segments, truncated };
     };
 
     const buildVoiceDirectorUserPrompt = ({ character, user, context, text }) => {
@@ -223,12 +345,105 @@
         const detail = payload?.error?.message || payload?.message || payload?.error || payload?.msg;
         if (typeof detail === 'string' && detail.trim()) return detail.trim();
         if (status === 429) return '语音合成请求过于频繁（限流 100 RPM / 10M TPM），请稍后重试';
-        if (status === 401 || status === 403) return '语音合成鉴权失败，请检查 MiMo 语音合成密钥';
+        if (status === 401) return '语音合成鉴权失败，请检查 MiMo 语音合成密钥（Token Plan 与按量付费的 Key 不可混用）';
+        if (status === 403) return '语音合成被拒绝：服务暂不支持当前地区，或 API Key 被风控，请更换 Key 后重试';
         if (status === 402) return '语音合成账户余额或额度不足';
+        if (status === 421) return '合成文本被内容审核拦截，请调整文本后重试';
+        if (status === 400) return '语音合成请求格式错误（400）：请检查合成模型名、音频格式与文本长度';
         return `语音合成接口返回 ${status}`;
     };
 
-    const requestMimoSpeech = async ({ url, baseUrl, apiKey, model, format, voiceDesign, text, signal }) => {
+    const writeAscii = (view, offset, value) => {
+        for (let i = 0; i < value.length; i++) view.setUint8(offset + i, value.charCodeAt(i));
+    };
+
+    // 兼容直接返回 base64 与返回 data URL 两种形态，顺带容忍换行与空格。
+    const base64ToBytes = (value) => {
+        const normalized = String(value == null ? '' : value).replace(/^data:[^;,]*;base64,/i, '').replace(/\s+/g, '');
+        if (!normalized) return new Uint8Array(0);
+        const binary = atob(normalized);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    };
+
+    const concatBytes = (list) => {
+        let total = 0;
+        for (const item of list) total += item.length;
+        const merged = new Uint8Array(total);
+        let offset = 0;
+        for (const item of list) {
+            merged.set(item, offset);
+            offset += item.length;
+        }
+        return merged;
+    };
+
+    // 流式返回的是 24kHz PCM16LE 单声道裸流，<audio> 认不了，这里补一个 44 字节 WAV 头。
+    const buildWavBlob = (pcmBytes, sampleRate = TTS_PCM_SAMPLE_RATE) => {
+        const bytes = pcmBytes instanceof Uint8Array ? pcmBytes : new Uint8Array(pcmBytes || 0);
+        const channels = 1;
+        const bitsPerSample = 16;
+        const blockAlign = channels * bitsPerSample / 8;
+        const buffer = new ArrayBuffer(44 + bytes.length);
+        const view = new DataView(buffer);
+        writeAscii(view, 0, 'RIFF');
+        view.setUint32(4, 36 + bytes.length, true);
+        writeAscii(view, 8, 'WAVE');
+        writeAscii(view, 12, 'fmt ');
+        view.setUint32(16, 16, true);
+        view.setUint16(20, 1, true);
+        view.setUint16(22, channels, true);
+        view.setUint32(24, sampleRate, true);
+        view.setUint32(28, sampleRate * blockAlign, true);
+        view.setUint16(32, blockAlign, true);
+        view.setUint16(34, bitsPerSample, true);
+        writeAscii(view, 36, 'data');
+        view.setUint32(40, bytes.length, true);
+        new Uint8Array(buffer, 44).set(bytes);
+        return new Blob([buffer], { type: 'audio/wav' });
+    };
+
+    // 逐行解析 SSE，把 choices[0].delta.audio.data 的 base64 分片交给 onChunk，返回累计字节数。
+    const readSseAudio = async (response, onChunk) => {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let total = 0;
+        const handleLine = (line) => {
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith(':') || !trimmed.startsWith('data:')) return;
+            const payload = trimmed.slice(5).trim();
+            if (!payload || payload === '[DONE]') return;
+            let parsed;
+            try { parsed = JSON.parse(payload); } catch (_) { return; }
+            const data = parsed?.choices?.[0]?.delta?.audio?.data;
+            if (!data) return;
+            const bytes = base64ToBytes(data);
+            if (!bytes.length) return;
+            total += bytes.length;
+            onChunk(bytes);
+        };
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let index;
+            while ((index = buffer.indexOf('\n')) >= 0) {
+                handleLine(buffer.slice(0, index));
+                buffer = buffer.slice(index + 1);
+            }
+        }
+        buffer += decoder.decode();
+        if (buffer) handleLine(buffer);
+        return total;
+    };
+
+    // 一次 MiMo 语音合成请求。voicedesign 走 instruction=音色描述、不带 voice；
+    // 预置音色走 instruction=风格指令 + voice=预置音色 ID，可选流式（pcm16 → 本地拼 WAV）。
+    const requestMimoSpeech = async ({
+        url, baseUrl, apiKey, model, format, voice, instruction, text, stream = false, signal
+    }) => {
         const controller = new AbortController();
         const abort = () => controller.abort();
         let timer;
@@ -243,37 +458,52 @@
         try {
             // 与音色设计链路共用同一套地址归一化：缺 /v1 时自动补齐。
             const endpoint = url || `${String(baseUrl || DEFAULT_TTS_BASE_URL).replace(/\/+$/, '')}/chat/completions`;
+            // user 消息只承载风格/音色指令，其内容不会出现在合成语音里；留空时用中性朗读指令兜底。
+            const userInstruction = String(instruction == null ? '' : instruction).trim();
+            const audio = { format };
+            if (voice) audio.voice = voice;
+            const body = {
+                model,
+                messages: [
+                    { role: 'user', content: userInstruction || DEFAULT_PRESET_INSTRUCTION },
+                    { role: 'assistant', content: text }
+                ],
+                audio
+            };
+            if (stream) body.stream = true;
             const response = await fetch(endpoint, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-                body: JSON.stringify({
-                    model,
-                    messages: [
-                        { role: 'user', content: voiceDesign },
-                        { role: 'assistant', content: text }
-                    ],
-                    audio: { format }
-                }),
+                body: JSON.stringify(body),
                 signal: controller.signal
             });
             touch();
+            if (!response.ok) {
+                const raw = await response.text();
+                let payload = null;
+                try { payload = JSON.parse(raw); } catch (_) { }
+                throw new Error(readMimoErrorMessage(payload, response.status));
+            }
+            if (stream) {
+                if (!response.body?.getReader) throw new Error('当前浏览器不支持流式语音响应，请关闭流式合成');
+                const parts = [];
+                // 分片持续到达，每次收到数据都把超时窗口往后推。
+                const total = await readSseAudio(response, bytes => { parts.push(bytes); touch(); });
+                if (!total) throw new Error('语音合成接口未返回音频数据');
+                return buildWavBlob(concatBytes(parts));
+            }
             const raw = await response.text();
             let payload = null;
             try { payload = JSON.parse(raw); } catch (_) { }
-            if (!response.ok) throw new Error(readMimoErrorMessage(payload, response.status));
             const audioPayload = payload?.choices?.[0]?.message?.audio;
             const base64 = typeof audioPayload === 'string' ? audioPayload : audioPayload?.data;
             if (!base64) throw new Error('语音合成接口未返回音频数据');
-            // 兼容直接返回 base64 与返回 data URL 两种形态。
-            const normalizedBase64 = String(base64).replace(/^data:[^;,]*;base64,/i, '').replace(/\s+/g, '');
-            const bytes = atob(normalizedBase64);
-            const buffer = new Uint8Array(bytes.length);
-            for (let i = 0; i < bytes.length; i++) buffer[i] = bytes.charCodeAt(i);
+            const bytes = base64ToBytes(base64);
             const resolvedFormat = String(audioPayload?.format || format || DEFAULT_TTS_FORMAT).toLowerCase();
             const mime = resolvedFormat.includes('mpeg') || resolvedFormat === 'mp3' ? 'audio/mpeg'
                 : resolvedFormat.includes('pcm') ? 'audio/wav'
                     : resolvedFormat.includes('ogg') ? 'audio/ogg' : 'audio/wav';
-            return new Blob([buffer], { type: mime });
+            return new Blob([bytes], { type: mime });
         } catch (error) {
             if (timedOut && !signal?.aborted) {
                 const timeout = new Error('语音合成超时，请稍后重试');
@@ -345,7 +575,24 @@
             return text;
         };
 
-        const cacheKeyOf = (key, text) => `${key}::${text.length}::${text.slice(0, 64)}`;
+        // 当前朗读方式：voicedesign（LLM 音色设计，逐段分角色）或 preset（预置音色整段朗读）。
+        const resolveTtsMode = () => normalizeTtsMode(settings.ttsMode);
+        const presetVoiceOf = () => normalizePresetVoice(settings.ttsVoice);
+        const presetStyleTagOf = () => normalizeStyleTag(settings.ttsPresetStyle);
+        const presetInstructionOf = () => String(settings.ttsPresetInstruction || '').trim() || DEFAULT_PRESET_INSTRUCTION;
+        // 流式开关只认严格布尔，缓存签名与真实请求共用同一判定，避免两处语义漂移。
+        const presetStreamOn = () => settings.ttsPresetStream === true;
+
+        // 缓存键带上朗读方式与音色/模型/指令：换音色或换模式后不能命中上一套音频。密钥不进键，避免把凭据写进内存字符串。
+        const cacheKeyOf = (key, text) => {
+            const mode = resolveTtsMode();
+            const signature = mode === TTS_MODE_PRESET
+                ? [settings.ttsApiUrl, settings.ttsPresetModel, presetVoiceOf(), presetStyleTagOf(), presetInstructionOf(),
+                    presetStreamOn() ? 'stream' : 'buffer'].join('|')
+                : [settings.ttsApiUrl, settings.ttsModel, settings.ttsDesignModel, settings.ttsDesignApiUrl,
+                    settings.ttsContextRange, settings.ttsCustomInstruction].join('|');
+            return `${mode}::${signature}::${key}::${text.length}::${text.slice(0, 64)}`;
+        };
 
         // 缓存里存的是 Blob 本身，不持有 objectURL，因此淘汰时无需 revoke。
         const trimCache = () => {
@@ -527,7 +774,29 @@
             return normalizeVoicePlan(payload, text);
         };
 
+        // 预置音色整段朗读：不做 LLM 音色设计，整条气泡按长度上限切块后直接交给 mimo-v2.5-tts。
+        const synthesizePresetChunk = async ({ text, signal }) => {
+            const apiKey = String(settings.ttsApiKey || '').trim();
+            if (!apiKey) throw new Error('请先在设置中填写 MiMo 语音合成 API Key');
+            const model = String(settings.ttsPresetModel || '').trim() || DEFAULT_TTS_PRESET_MODEL;
+            const baseUrl = String(settings.ttsApiUrl || '').trim() || DEFAULT_TTS_BASE_URL;
+            const stream = presetStreamOn();
+            return requestMimoSpeech({
+                url: buildApiEndpoint(baseUrl, 'chat/completions'),
+                apiKey,
+                model,
+                // 流式只出 pcm16，拿回来本地补 WAV 头；非流式直接要 wav。
+                format: stream ? 'pcm16' : DEFAULT_TTS_FORMAT,
+                voice: presetVoiceOf(),
+                instruction: presetInstructionOf(),
+                text: applyStyleTag(text, presetStyleTagOf()),
+                stream,
+                signal
+            });
+        };
+
         const synthesizeSegment = async ({ segment, signal }) => {
+            if (segment?.preset) return synthesizePresetChunk({ text: segment.text, signal });
             const apiKey = String(settings.ttsApiKey || '').trim();
             if (!apiKey) throw new Error('请先在设置中填写 MiMo 语音合成 API Key');
             const model = String(settings.ttsModel || '').trim() || DEFAULT_TTS_MODEL;
@@ -540,10 +809,28 @@
                 apiKey,
                 model,
                 format: DEFAULT_TTS_FORMAT,
-                voiceDesign,
+                instruction: voiceDesign,
                 text: segment.text,
                 signal
             });
+        };
+
+        // 预置音色模式不经过 LLM：整条气泡文本直接切块，音色固定为设置里的预置音色。
+        const buildSpeechPlan = async ({ text, index, signal, mode }) => {
+            if (mode !== TTS_MODE_PRESET) {
+                // designVoicePlan 已经带回 truncated（与 normalizeVoicePlan 的截断口径一致）。
+                const plan = await designVoicePlan({ text, index, signal });
+                return { ...plan, truncated: plan.truncated === true };
+            }
+            const chunks = splitForPresetSpeech(text);
+            if (!chunks.length) throw new Error('这条消息没有可朗读的文本');
+            const label = presetVoiceLabel(settings.ttsVoice);
+            return {
+                sceneTone: '',
+                // 只有真的被截断才提示，避免「提示只读前 N 段、实际全读完」的误报。
+                truncated: chunks.length > MAX_SEGMENTS,
+                segments: chunks.slice(0, MAX_SEGMENTS).map(chunk => ({ preset: true, label, text: chunk }))
+            };
         };
 
         const playBlob = (url, token) => new Promise((resolve, reject) => {
@@ -598,10 +885,13 @@
             stopSpeaking();
             const token = ++playbackToken;
             const key = messageKeyOf(msg, index);
+            const mode = resolveTtsMode();
             const cacheKey = cacheKeyOf(key, text);
             ttsState.activeKey = key;
-            ttsState.status = 'designing';
-            ttsState.stage = '正在分析旁白与对白，设计音色…';
+            ttsState.status = mode === TTS_MODE_PRESET ? 'synthesizing' : 'designing';
+            ttsState.stage = mode === TTS_MODE_PRESET
+                ? '正在用预置音色合成整条气泡…'
+                : '正在分析旁白与对白，设计音色…';
             ttsState.error = '';
             activeController = new AbortController();
             const signal = activeController.signal;
@@ -613,17 +903,21 @@
                     ttsState.total = entry.blobs.length;
                 } else {
                     ttsState.fromCache = false;
-                    const plan = await designVoicePlan({ text, index, signal });
+                    const plan = await buildSpeechPlan({ text, index, signal, mode });
                     if (token !== playbackToken) return;
-                    if (!plan.segments.length) throw new Error('音色设计未返回可朗读的片段');
-                    if (plan.segments.length >= MAX_SEGMENTS) {
-                        showToast(`内容较长，本次只朗读前 ${MAX_SEGMENTS} 段`, 'info');
+                    if (!plan.segments.length) {
+                        throw new Error(mode === TTS_MODE_PRESET ? '这条消息没有可朗读的文本' : '音色设计未返回可朗读的片段');
+                    }
+                    if (plan.truncated) {
+                        showToast(mode === TTS_MODE_PRESET
+                            ? `内容较长，本次只朗读前 ${MAX_SEGMENTS} 块（约 ${MAX_SEGMENTS * MAX_PRESET_CHUNK_LENGTH} 字）`
+                            : `内容较长，本次只朗读前 ${MAX_SEGMENTS} 段`, 'info');
                     }
                     ttsState.sceneTone = plan.sceneTone;
                     ttsState.speakerLabels = [...new Set(plan.segments.map(segment => segment.label))];
                     ttsState.total = plan.segments.length;
                     ttsState.done = 0;
-                    // 分段合成：受 RPM 限制，最多同时跑 3 段，其余排队；播放仍严格按剧情顺序。
+                    // 分段合成：受 RPM 限制，最多同时跑 3 段，其余排队；播放仍严格按原文顺序。
                     const blobs = new Array(plan.segments.length);
                     const queue = plan.segments.map((segment, position) => ({ segment, position }));
                     const concurrency = Math.max(1, Math.min(SYNTHESIS_CONCURRENCY, queue.length));
@@ -689,32 +983,36 @@
             speakMessage(index);
         };
 
-        // 设置面板的连通性自检：不经过 LLM 音色设计，直接用一段固定音色合成并播放。
+        // 设置面板的连通性自检：按当前朗读方式各走一遍真实链路（不经过 LLM 音色设计）。
         const testTtsConnection = async () => {
             if (String(settings.ttsApiKey || '').trim() === '') {
                 showToast('请先填写 MiMo 语音合成 API Key', 'error');
                 return;
             }
+            const mode = resolveTtsMode();
             stopSpeaking();
             const token = ++playbackToken;
             ttsState.activeKey = '__tts_test__';
             ttsState.status = 'synthesizing';
-            ttsState.stage = '正在合成测试语音…';
+            ttsState.stage = mode === TTS_MODE_PRESET ? '正在用预置音色合成测试语音…' : '正在合成测试语音…';
             ttsState.error = '';
             ttsState.total = 1;
             ttsState.done = 0;
             activeController = new AbortController();
             const signal = activeController.signal;
             try {
-                const blob = await synthesizeSegment({
-                    segment: {
-                        label: '测试',
-                        voiceDesign: '清亮自然的中文女声，二十多岁，语速适中偏轻快，语气亲切友好，吐字清晰干净。',
-                        text: '语音朗读已连接成功，这是一段用于测试的示例语音。',
-                        delivery: ''
-                    },
-                    signal
-                });
+                const testText = '语音朗读已连接成功，这是一段用于测试的示例语音。';
+                const blob = mode === TTS_MODE_PRESET
+                    ? await synthesizePresetChunk({ text: testText, signal })
+                    : await synthesizeSegment({
+                        segment: {
+                            label: '测试',
+                            voiceDesign: '清亮自然的中文女声，二十多岁，语速适中偏轻快，语气亲切友好，吐字清晰干净。',
+                            text: testText,
+                            delivery: ''
+                        },
+                        signal
+                    });
                 if (token !== playbackToken) return;
                 ttsState.status = 'playing';
                 ttsState.stage = '正在播放测试语音…';
@@ -728,7 +1026,9 @@
                 }
                 ttsState.done = 1;
                 if (token === playbackToken) resetTtsState();
-                showToast('语音合成连接正常', 'success');
+                showToast(mode === TTS_MODE_PRESET
+                    ? `预置音色朗读连接正常（${presetVoiceLabel(settings.ttsVoice)}）`
+                    : '语音合成连接正常', 'success');
             } catch (error) {
                 if (token !== playbackToken) return;
                 try { activeController?.abort(); } catch (_) { }
@@ -759,7 +1059,26 @@
     window.RPHubTts = Object.freeze({
         DEFAULT_TTS_BASE_URL,
         DEFAULT_TTS_MODEL,
+        DEFAULT_TTS_PRESET_MODEL,
+        DEFAULT_TTS_PRESET_VOICE,
         DEFAULT_TTS_FORMAT,
+        DEFAULT_PRESET_INSTRUCTION,
+        TTS_MODE_VOICEDESIGN,
+        TTS_MODE_PRESET,
+        TTS_MODE_OPTIONS,
+        PRESET_VOICE_OPTIONS,
+        TTS_PCM_SAMPLE_RATE,
+        MAX_PRESET_CHUNK_LENGTH,
+        normalizeTtsMode,
+        normalizePresetVoice,
+        presetVoiceLabel,
+        normalizeStyleTag,
+        applyStyleTag,
+        splitForPresetSpeech,
+        base64ToBytes,
+        concatBytes,
+        buildWavBlob,
+        readSseAudio,
         UNRESTRICTED_INJECTION,
         buildVoiceDirectorSystemPrompt,
         buildVoiceDirectorUserPrompt,
