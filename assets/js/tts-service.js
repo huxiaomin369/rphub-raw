@@ -61,7 +61,8 @@
 
     const VOICE_DIRECTOR_ROLE = [
         '你是 RP-Hub 的语音导演（Voice Director），负责把一段角色扮演正文改编成可直接交给「文本音色设计（voice design）」语音合成模型的分镜脚本。',
-        '你的工作只有两件：判断哪些内容是旁白、哪些是某个角色的对白；为每个说话人写出一段能直接驱动音色合成的音色描述。'
+        '你的工作只有两件：判断哪些内容是旁白、哪些是某个角色的对白；为每个说话人写出一段能直接驱动音色合成的音色描述。',
+        '记住这两件事的分工：音色描述（voiceDesign）回答「这副嗓子长什么样」，是跨段落复用的身份卡；演绎提示（delivery）回答「这一段怎么演」，是一次性的表演指令。两者混在一起，同一个角色就会在不同段落变成不同的人。'
     ].join('\n');
 
     const VOICE_PLAN_SCHEMA = [
@@ -69,23 +70,63 @@
         '{',
         '  "sceneTone": "对整段内容语气氛围的一句话概括",',
         '  "speakers": [',
-        '    { "id": "narrator", "label": "旁白", "voiceDesign": "音色描述" },',
-        '    { "id": "角色名", "label": "角色名", "voiceDesign": "音色描述" }',
+        '    { "id": "narrator", "label": "旁白", "voiceDesign": "嗓子身份卡：1-2 句白描，写年龄段与性别、声音质感、语速节奏、情绪底色" },',
+        '    { "id": "角色名", "label": "角色名", "voiceDesign": "嗓子身份卡：写法同上，与该角色原文中的年龄、身份、性格一致" }',
         '  ],',
         '  "segments": [',
-        '    { "speaker": "narrator", "text": "片段原文", "delivery": "可选：该片段的演绎提示，如 语速/气息/停顿/重音" }',
+        '    { "speaker": "narrator", "text": "片段原文", "delivery": "可选：本段怎么演（语速/气息/停顿/重音/情绪起伏），不写音色" }',
         '  ]',
         '}'
     ].join('\n');
 
+    // 音色描述（voiceDesign）的写法直接决定合成出来像不像那个人。
+    // 本节严格对齐 MiMo 官方 SKILL 的「音色描述编写」：身份卡只写嗓子本身，
+    // 不写场景、不写动作、不写这段要说什么；越凝练越容易在不同段落之间保持同一个人。
     const VOICE_DESIGN_RULES = [
-        '【音色描述 voiceDesign 规则】',
-        '- 这段描述会作为文本音色设计模型的输入，长度 1-4 句，中文或英文均可，越具体越贴合预期。',
-        '- 必须覆盖：性别与年龄感、音色质感、情绪基调、语速节奏；可补充角色人设、说话习惯、场景感、年代或口音参照。',
-        '- 禁止出现混响、回声、EQ、压缩、降噪、立体声等后期处理词；禁止「普通的」「正常的」「一般」这类无指向描述；禁止自相矛盾的特征组合（如稚嫩童声 + 霸道总裁气场）。',
-        '- 旁白与每一个出场角色都必须使用互不相同的音色；同一角色在所有片段里复用同一段描述。',
-        '- 音色必须贴合该角色在原文中的性别、年龄、身份、性格，以及此刻所处的情绪位置；主角情绪剧烈变化时，用 delivery 字段体现，不要推翻音色本身。',
-        '- 旁白音色要符合本段内容的体裁与氛围（如深夜电台、古典评书、冷淡的第三人称叙述、黏腻的贴身低语）。'
+        '【音色描述 voiceDesign 规则｜这是嗓子的身份卡】',
+        'voiceDesign 会原样作为 mimo-v2.5-tts-voicedesign 的 context 输入，是该说话人唯一的音色来源。只描写这副嗓子本身长什么样，不描写它此刻在做什么。',
+        '',
+        '必写四项（缺一项就退化成没有辨识度的通用嗓）：',
+        '1. 身份锚点：年龄段 + 性别，决定基频，是其余所有特质的地基，必须放在最前面。',
+        '2. 声音质感：气息走向、共鸣位置、吐字方式、音色底色。用可感的动词或比喻（如「字像是从胸腔里挤出来的」「尾音收在鼻腔上方」），不要堆「好听」「有磁性」「很特别」这类空泛形容词。',
+        '3. 语速节奏：稳 / 快 / 慢 / 忽快忽慢 / 连珠带顿挫，选一种并说清楚。',
+        '4. 情绪底色：嗓子的默认状态，如高亢、松弛、温软、克制、冷硬。',
+        '',
+        '强烈推荐两项（写了辨识度会明显提升）：',
+        '5. 风格或身份锚点：一笔带过的职业或腔调参照，如播音员风格、法庭陈词风格、拍卖师风格、深夜电台主持风格、古典评书先生、美食评论家风格。',
+        '6. 辨识度小癖好：一个让人一耳朵记住的习惯，如字尾带轻微颤音、笑起来是胸腔闷笑、句尾习惯性下沉、开口前先吸一口气。',
+        '',
+        '硬约束（违反就会导致音色漂移或失真）：',
+        '- 长度 1-2 句，白描式，不分段、不列条、不加标题、不用 Markdown。',
+        '- 禁止写场景（如「在发布会上」「值夜班时」「祠堂的阴影里」）、禁止写动作（如「她走上舞台」「他抬起头」）、禁止复述本段的具体台词或情节。',
+        '- 禁止出现混响、回声、EQ、压缩、降噪、立体声、采样率等后期或工程词。',
+        '- 禁止「普通的」「正常的」「一般的声音」这类无指向描述；禁止自相矛盾的特征组合（如稚嫩童声 + 霸道总裁气场）。',
+        '- 禁止使用真实演员、明星、配音演员或已有 IP 角色的名字，一律改写成声音特征本身。',
+        '- 默认普通话；只有原文明确要求方言或外语口音时才写，且只写一种。',
+        '- 旁白与每一个出场角色都必须使用互不相同的音色：彼此至少在「性别 / 年龄段 / 共鸣位置」三项中拉开两项差异，不能只换几个形容词。',
+        '- 同一个说话人在整份输出里必须始终使用逐字相同的 voiceDesign，不得因为段落情绪不同而改写音色；情绪变化一律交给 delivery。',
+        '',
+        '正例（照这个密度写，不要写得更长）：',
+        '- 中年男性，声线低沉醇厚、胸腔共鸣重，吐字慢而字字顿挫，情绪克制。法庭陈词风格，句尾习惯性下沉。',
+        '- 青年女性，气息偏浅、贴在鼻腔上方，语速快而连贯带明显气口，情绪松软微甜。偶尔把尾音拖长半拍。',
+        '- 青年男性，声音清亮偏薄，咬字干脆、唇齿音很轻，语速忽快忽慢。电竞解说风格，兴奋时尾音上扬发尖。',
+        '- 老年男性，嗓子里带砂纸般的颗粒感，气息短、句间停顿长，情绪温和。评书先生风格，说到起劲处会先吸一口气。'
+    ].join('\n');
+
+    // 音色设计 prompt 的版本号：prompt 本身也是「音色的生成输入」之一，必须进缓存签名。
+    // 改了规则（比如长度从 1-4 句收窄到 1-2 句、新增正例）却不递增它，
+    // 旧缓存里的音频会继续命中，用户会以为「提示词改了，但一点变化都没有」。
+    const VOICE_DESIGN_PROMPT_VERSION = 'card-v2';
+
+    // delivery 是「这一段怎么演」，voiceDesign 是「这副嗓子长什么样」，两者必须彻底分开。
+    // voicedesign 每段都是独立请求：delivery 里出现任何音色词，都会让这个说话人在本段换一副嗓子。
+    const DELIVERY_RULES = [
+        '【本段演绎 delivery 规则】',
+        '- delivery 只描述这一段怎么演，不是重新设计音色。',
+        '- 只允许写这五类：语速、气息（换气 / 屏息 / 气息发虚）、停顿（长短与位置）、重音（哪个词咬重）、情绪起伏（克制 / 爆发 / 哽咽 / 松下来）。',
+        '- 禁止在 delivery 里写音色本身：不得出现年龄、性别、嗓音粗细、沙哑、清亮、共鸣位置、音域、口音、方言。这些属于 voiceDesign，写进 delivery 会让这个说话人在本段换一个人。',
+        '- 不必每段都写：只有该段确实存在情绪或节奏转折时才写，平淡段落留空字符串。留空能让这个说话人所有段的音色输入保持一致，是最稳的做法。',
+        '- 一句话写完，不超过 40 字。'
     ].join('\n');
 
     const SEGMENT_RULES = [
@@ -96,7 +137,7 @@
         '- 若原文完全没有引号，则全部按旁白处理。',
         '- 单个 segment 不超过 ' + MAX_SEGMENT_LENGTH + ' 字，超出就继续切分。',
         '- segments 总数不超过 ' + MAX_SEGMENTS + ' 个；内容过长时按剧情顺序合并相邻的同角色短片段，优先保留对白。',
-        '- 若某个片段存在明显的情绪或节奏转折（如平静转暴怒、压抑到哽咽），为该片段补上 delivery 提示。'
+        '- 若某个片段存在明显的情绪或节奏转折（如平静转暴怒、压抑到哽咽），为该片段补上 delivery 提示；补的时候只写怎么演，不要碰音色。'
     ].join('\n');
 
     const buildVoiceDirectorSystemPrompt = (extraInstruction) => [
@@ -107,6 +148,8 @@
         VOICE_PLAN_SCHEMA,
         '',
         VOICE_DESIGN_RULES,
+        '',
+        DELIVERY_RULES,
         '',
         SEGMENT_RULES,
         extraInstruction ? '\n【用户附加音色要求】\n' + extraInstruction : ''
@@ -219,6 +262,18 @@
         const body = String(text == null ? '' : text);
         const tag = normalizeStyleTag(styleTag);
         return tag && body ? `(${tag})${body}` : body;
+    };
+
+    // voicedesign 只有 context 一个通道，音色身份卡与本次演绎必须挤在同一段描述里。
+    // 所以这里用显式标签把两段隔开，并把「只改表演、不改音色」写在拼装处：
+    // 每段都是独立请求，模型一旦把表演指令读成音色描述，同一角色在本段就会换一副嗓子。
+    const VOICE_DELIVERY_PREFIX = '本段演绎（只调整这一次的语速、气息、停顿、重音与情绪起伏，不改这副嗓子的音色底色）：';
+    const composeVoiceInstruction = (voiceDesign, delivery) => {
+        const base = String(voiceDesign == null ? '' : voiceDesign).trim();
+        const act = String(delivery == null ? '' : delivery).trim();
+        // delivery 为空时保持指令与其它段落逐字相同，这是压住音色漂移最有效的一招。
+        if (!act) return base;
+        return base ? `${base}\n${VOICE_DELIVERY_PREFIX}${act}` : `${VOICE_DELIVERY_PREFIX}${act}`;
     };
 
     // 硬切兜底：优先在末段空白处断开，避免把英文单词切成两半（中文无词边界，按上限切即可）。
@@ -360,7 +415,7 @@
         }
         if (!segments.length && fallbackText) {
             const voiceDesign = fallbackSpeaker?.voiceDesign
-                || '沉稳自然的中性旁白嗓音，语速平缓，吐字清晰，情绪克制而富有叙事感。';
+                || '中年男性，声线沉稳中性、胸腔共鸣为主，吐字清晰工整，语速平稳，情绪克制。播音员风格。';
             segments.push({
                 speakerId: 'narrator',
                 label: fallbackSpeaker?.label || '旁白',
@@ -809,7 +864,9 @@
                 ? [settings.ttsApiUrl, settings.ttsPresetModel, presetVoiceOf(), presetStyleTagOf(), presetInstructionOf(),
                     presetStreamOn() ? 'stream' : 'buffer'].join('|')
                 : [settings.ttsApiUrl, settings.ttsModel, settings.ttsDesignModel, settings.ttsDesignApiUrl,
-                    settings.ttsContextRange, settings.ttsCustomInstruction].join('|');
+                    settings.ttsContextRange, settings.ttsCustomInstruction,
+                    // prompt 版本进签名：改了音色设计规则就必须换一套音频，不能沿用旧缓存。
+                    VOICE_DESIGN_PROMPT_VERSION].join('|');
             return `${mode}::${signature}::${key}::${text.length}::${text.slice(0, 64)}`;
         };
 
@@ -1043,9 +1100,8 @@
             if (!apiKey) throw new Error('请先在设置中填写 MiMo 语音合成 API Key');
             const model = String(settings.ttsModel || '').trim() || DEFAULT_TTS_MODEL;
             const baseUrl = String(settings.ttsApiUrl || '').trim() || DEFAULT_TTS_BASE_URL;
-            const voiceDesign = segment.delivery
-                ? `${segment.voiceDesign} 本段演绎要求：${segment.delivery}`
-                : segment.voiceDesign;
+            // 音色身份卡 + 本段演绎：拼装规则集中在 composeVoiceInstruction，便于单测锁住。
+            const voiceDesign = composeVoiceInstruction(segment.voiceDesign, segment.delivery);
             return requestMimoSpeech({
                 url: buildApiEndpoint(baseUrl, 'chat/completions'),
                 apiKey,
@@ -1540,7 +1596,7 @@
                     : await synthesizeSegment({
                         segment: {
                             label: '测试',
-                            voiceDesign: '清亮自然的中文女声，二十多岁，语速适中偏轻快，语气亲切友好，吐字清晰干净。',
+                            voiceDesign: '青年女性，声线清亮、气息贴在口腔前部，吐字干净利落，语速适中偏轻快，情绪亲切友好。',
                             text: testText,
                             delivery: ''
                         },
@@ -1633,6 +1689,9 @@
         presetVoiceLabel,
         normalizeStyleTag,
         applyStyleTag,
+        // 音色身份卡 + 本段演绎的拼装规则：voicedesign 只有 context 一个通道，两段必须显式隔离。
+        composeVoiceInstruction,
+        VOICE_DELIVERY_PREFIX,
         splitForPresetSpeech,
         base64ToBytes,
         concatBytes,
@@ -1643,6 +1702,12 @@
         locateTimelinePosition,
         readSseAudio,
         UNRESTRICTED_INJECTION,
+        // 音色设计规则原文：测试逐条断言，避免「规则被改坏、测试还是绿」。
+        VOICE_PLAN_SCHEMA,
+        VOICE_DESIGN_RULES,
+        DELIVERY_RULES,
+        // prompt 版本进缓存签名；改规则忘了递增它，用户就听不到新音色。
+        VOICE_DESIGN_PROMPT_VERSION,
         buildVoiceDirectorSystemPrompt,
         buildVoiceDirectorUserPrompt,
         extractJsonObject,
