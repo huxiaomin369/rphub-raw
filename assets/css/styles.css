@@ -1684,6 +1684,92 @@ button.sortable-item-main:focus-visible { outline: 2px solid rgb(var(--primary-4
     .tts-action-status { line-height: 1.75rem; }
 }
 
+/* 气泡朗读进度条：朗读中贴在气泡底部，左侧暂停/继续，中间可拖动定位，右侧时间。 */
+.tts-player {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.375rem 0.75rem 0.5rem;
+    border-top: 1px solid rgb(var(--primary-500) / 0.16);
+    background: rgb(var(--primary-500) / 0.06);
+    animation: pop-in var(--dur-2) var(--ease-out) both;
+}
+.tts-player-toggle {
+    display: flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 1.25rem;
+    height: 1.25rem;
+    border-radius: 999px;
+    color: #fff;
+    background: var(--c-accent-text);
+    transition: transform var(--dur-2) var(--ease-spring), opacity var(--dur-2) ease;
+}
+.tts-player-toggle:hover { opacity: 0.86; }
+.tts-player-toggle:active { transform: scale(0.88); }
+.tts-player-toggle:focus-visible { outline: 2px solid rgb(var(--primary-500) / 0.45); outline-offset: 2px; }
+
+.tts-player-range {
+    flex: 1 1 auto;
+    min-width: 3rem;
+    height: 14px;
+    margin: 0;
+    background: transparent;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+}
+.tts-player-range:focus { outline: none; }
+/* 已播放部分用 --tts-progress（由模板按百分比写进行内样式）描出来。 */
+.tts-player-range::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(to right,
+        rgb(var(--primary-600)) var(--tts-progress, 0%),
+        rgb(var(--primary-200)) var(--tts-progress, 0%));
+}
+.tts-player-range::-moz-range-track {
+    height: 4px;
+    border-radius: 999px;
+    background: rgb(var(--primary-200));
+}
+.tts-player-range::-moz-range-progress {
+    height: 4px;
+    border-radius: 999px;
+    background: rgb(var(--primary-600));
+}
+.tts-player-range::-webkit-slider-thumb {
+    width: 11px;
+    height: 11px;
+    margin-top: -3.5px;
+    border: 2px solid #fff;
+    border-radius: 999px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgb(var(--primary-600));
+    box-shadow: 0 1px 4px rgb(var(--primary-700) / 0.45);
+    transition: transform var(--dur-2) var(--ease-spring);
+}
+.tts-player-range:active::-webkit-slider-thumb { transform: scale(1.25); }
+.tts-player-range:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px rgb(var(--primary-500) / 0.25); }
+.tts-player-range::-moz-range-thumb {
+    width: 9px;
+    height: 9px;
+    border: 2px solid #fff;
+    border-radius: 999px;
+    background: rgb(var(--primary-600));
+    box-shadow: 0 1px 4px rgb(var(--primary-700) / 0.45);
+}
+.tts-player-time {
+    flex: none;
+    color: var(--c-text-3);
+    font-size: 0.6875rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
 @media (hover: none) {
     .message-action-button:hover,
     .message-action-button--danger:hover { color: var(--c-text-3); background: transparent; transform: none; }

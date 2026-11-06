@@ -8327,6 +8327,8 @@ const app = createApp({
             speakMessage,
             stopSpeaking,
             toggleSpeakMessage,
+            seekSpeaking,
+            togglePauseSpeaking,
             testTtsConnection,
             clearTtsCache
         } = useSpeechSynthesis({
@@ -8341,6 +8343,51 @@ const app = createApp({
             resolveMessageText: content => replaceUserNamePlaceholder(stripMemoryCitations(
                 stripUiTemplateUpdateBlock(parseCot(content || '').main)
             ))
+        });
+
+        // 朗读进度条：拖动过程只用本地值跟手，松手才真正跳转，
+        // 否则每移动一像素就要打断并重启一次音频，听起来是断的。
+        const ttsScrub = reactive({ active: false, key: '', value: 0 });
+        const ttsProgressMax = computed(() => (ttsState.duration > 0 ? ttsState.duration : 0));
+        const ttsProgressValue = computed(() => (
+            ttsScrub.active && ttsScrub.key === ttsState.activeKey
+                ? ttsScrub.value
+                : ttsState.currentTime
+        ));
+        const ttsProgressPercent = computed(() => {
+            const total = ttsState.duration;
+            if (!(total > 0)) return 0;
+            return Math.max(0, Math.min(100, (ttsProgressValue.value / total) * 100));
+        });
+        // 进度条上的时间用 m:ss，与播放器惯例一致；非有限值一律回落到 0:00。
+        const formatTtsTime = (seconds) => {
+            const value = Number(seconds);
+            if (!Number.isFinite(value) || value <= 0) return '0:00';
+            const total = Math.floor(value);
+            const minutes = Math.floor(total / 60);
+            const rest = total % 60;
+            return `${minutes}:${String(rest).padStart(2, '0')}`;
+        };
+        const handleTtsScrubInput = (event) => {
+            const value = Number(event?.target?.value);
+            ttsScrub.active = true;
+            ttsScrub.key = ttsState.activeKey;
+            ttsScrub.value = Number.isFinite(value) && value > 0 ? value : 0;
+        };
+        const handleTtsScrubCommit = (event) => {
+            const raw = event?.target ? Number(event.target.value) : ttsScrub.value;
+            const value = Number.isFinite(raw) && raw > 0 ? raw : 0;
+            // 先清本地态：跳转后位置由播放循环回报，避免两边同时写这个值。
+            ttsScrub.active = false;
+            ttsScrub.key = '';
+            ttsScrub.value = 0;
+            seekSpeaking(value);
+        };
+        // 换一条气泡朗读时，把上一次没提交完的拖动状态一起丢掉。
+        watch(() => ttsState.activeKey, () => {
+            ttsScrub.active = false;
+            ttsScrub.key = '';
+            ttsScrub.value = 0;
         });
 
         return {
@@ -8409,6 +8456,7 @@ const app = createApp({
             handleConfirm, handleCancel, // Export handlers
             copyMessage, playMessageActionFeedback, canDeleteMessage, deleteMessage, regenerateMessage,
             ttsState, ttsCacheSize, canSpeakMessage, isSpeakingMessage, speakMessage, stopSpeaking, toggleSpeakMessage, testTtsConnection, clearTtsCache,
+            ttsScrub, ttsProgressMax, ttsProgressValue, ttsProgressPercent, formatTtsTime, handleTtsScrubInput, handleTtsScrubCommit, togglePauseSpeaking,
             ttsContextRangeOptions, ttsPlaybackRateOptions, ttsModeOptions, ttsPresetVoiceOptions, isTtsPresetMode, ttsModeBadgeLabel,
             editMessage, saveEditMessage, cancelEditMessage,
             createNewCharacter, editCharacter, saveCharacter, deleteCharacter, selectCharacter, toggleCharacterFavorite, isCharacterFavorite,

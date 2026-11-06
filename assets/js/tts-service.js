@@ -404,6 +404,80 @@
         return new Blob([buffer], { type: 'audio/wav' });
     };
 
+    // ── 朗读进度条 ──────────────────────────────────────────────────────
+    // 逐段合成拿到的是一串彼此独立的音频，而进度条要的是「一条时间轴」：
+    // 先量出每段时长，再把它们的全局起点累加成 starts；拖动时用 locateTimelinePosition
+    // 反查「第几段 + 段内偏移」，播放循环从那一点续播。三个函数都是纯函数，可独立验证。
+
+    // 直接从 WAV 头算时长：合成链路返回的就是 wav（流式在本地补头），
+    // 有了这个就不必为了画进度条再把每段音频走一遍媒体解码。
+    const parseWavDuration = (input) => {
+        const bytes = input instanceof Uint8Array ? input
+            : input instanceof ArrayBuffer ? new Uint8Array(input) : null;
+        if (!bytes || bytes.length < 44) return 0;
+        const ascii = offset => String.fromCharCode(
+            bytes[offset], bytes[offset + 1], bytes[offset + 2], bytes[offset + 3]);
+        if (ascii(0) !== 'RIFF' || ascii(8) !== 'WAVE') return 0;
+        const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        // RIFF 头里写了总长度时就按它收住，避免把尾部的垃圾字节当成块头继续解析。
+        const riffEnd = Math.min(bytes.length, 8 + view.getUint32(4, true));
+        let byteRate = 0;
+        let dataSize = 0;
+        let offset = 12;
+        while (offset + 8 <= riffEnd) {
+            const id = ascii(offset);
+            const size = view.getUint32(offset + 4, true);
+            if (id === 'fmt ' && offset + 16 <= riffEnd) {
+                // fmt 块布局：audioFormat(2) channels(2) sampleRate(4) byteRate(4)…
+                byteRate = view.getUint32(offset + 16, true);
+            } else if (id === 'data') {
+                dataSize = Math.min(size, riffEnd - offset - 8);
+                break;
+            }
+            // 块按偶数字节对齐，奇数长度后面跟一个补齐字节。
+            offset += 8 + size + (size % 2);
+        }
+        if (!byteRate || !dataSize) return 0;
+        return dataSize / byteRate;
+    };
+
+    // 逐段时长 → 时间轴。无法量出时长的段记 0，不会把整条进度条算歪。
+    const buildSpeechTimeline = (durations) => {
+        const list = (Array.isArray(durations) ? durations : []).map((value) => {
+            const seconds = Number(value);
+            return Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+        });
+        const starts = [];
+        let cursor = 0;
+        for (const seconds of list) {
+            starts.push(cursor);
+            cursor += seconds;
+        }
+        return { starts, durations: list, total: cursor };
+    };
+
+    // 全局秒数 → { index, offset }。进度条拖动与跳转都走这一个映射，两处口径不会漂移。
+    const locateTimelinePosition = (timeline, seconds) => {
+        const total = timeline && Number.isFinite(timeline.total) ? timeline.total : 0;
+        if (!timeline || !timeline.starts.length || total <= 0) return { index: 0, offset: 0 };
+        const raw = Number(seconds);
+        const clamped = Math.min(Math.max(Number.isFinite(raw) ? raw : 0, 0), total);
+        let index = timeline.starts.length - 1;
+        for (let i = 0; i < timeline.starts.length; i++) {
+            const end = timeline.starts[i] + timeline.durations[i];
+            // 零时长段永远不满足 clamped < end，天然被跳过，拖动不会在原地重启空段。
+            if (clamped < end) {
+                index = i;
+                break;
+            }
+        }
+        const offset = clamped - timeline.starts[index];
+        return {
+            index,
+            offset: Math.max(0, Math.min(offset, timeline.durations[index] || 0))
+        };
+    };
+
     // 逐行解析 SSE，把 choices[0].delta.audio.data 的 base64 分片交给 onChunk，返回累计字节数。
     const readSseAudio = async (response, onChunk) => {
         const reader = response.body.getReader();
@@ -536,7 +610,12 @@
             speakerLabels: [],
             total: 0,
             done: 0,
-            fromCache: false
+            fromCache: false,
+            // 进度条：duration = 整条气泡的总时长（秒），currentTime = 当前播放位置（秒，全局时间轴）。
+            duration: 0,
+            currentTime: 0,
+            paused: false,
+            seekable: false
         });
         const ttsCacheSize = ref(0);
 
@@ -552,6 +631,38 @@
             if (!pending) return;
             if (error) pending.reject(error);
             else pending.resolve();
+        };
+
+        // 进度条：把逐段音频拼成一条可定位的时间轴，拖动直接在这一层换算成「第几段 + 段内偏移」。
+        let activeTimeline = null;
+        let activeAudioIndex = -1;
+        // 拖动/跳转的目标位置。播放循环每段结束后读一次，读到就跳过去。
+        let pendingSeek = null;
+        let tickHandle = 0;
+
+        const cancelTick = () => {
+            if (!tickHandle) return;
+            const handle = tickHandle;
+            tickHandle = 0;
+            if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(handle);
+            else clearTimeout(handle);
+        };
+
+        const onTick = () => {
+            tickHandle = 0;
+            const audio = activeAudio;
+            if (!activeTimeline || !audio || activeAudioIndex < 0) return;
+            const within = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
+            const base = activeTimeline.starts[activeAudioIndex] || 0;
+            ttsState.currentTime = Math.max(0, Math.min(activeTimeline.total, base + within));
+            // 暂停/结束后不再排下一帧，进度停在当前位置。
+            if (!audio.paused && !audio.ended) scheduleTick();
+        };
+
+        const scheduleTick = () => {
+            if (tickHandle || !activeTimeline) return;
+            if (typeof requestAnimationFrame === 'function') tickHandle = requestAnimationFrame(onTick);
+            else tickHandle = setTimeout(onTick, 120);
         };
 
         const messageKeyOf = (msg, index) => String(msg?.id || `index-${index}`);
@@ -618,6 +729,10 @@
             && ttsState.activeKey === messageKeyOf(msg, index);
 
         const resetTtsState = () => {
+            cancelTick();
+            activeTimeline = null;
+            activeAudioIndex = -1;
+            pendingSeek = null;
             ttsState.activeKey = '';
             ttsState.status = 'idle';
             ttsState.stage = '';
@@ -627,9 +742,15 @@
             ttsState.total = 0;
             ttsState.done = 0;
             ttsState.fromCache = false;
+            ttsState.duration = 0;
+            ttsState.currentTime = 0;
+            ttsState.paused = false;
+            ttsState.seekable = false;
         };
 
         const releaseAudio = () => {
+            cancelTick();
+            activeAudioIndex = -1;
             settlePlayback(Object.assign(new Error('已取消朗读'), { name: 'AbortError' }));
             if (activeAudio) {
                 try {
@@ -833,7 +954,54 @@
             };
         };
 
-        const playBlob = (url, token) => new Promise((resolve, reject) => {
+        // 量一段音频的时长：先读 WAV 头（本地合成链路都是 wav，零解码成本），
+        // 头里读不出来时才退到媒体元数据探测。
+        const probeBlobDuration = (blob) => new Promise((resolve) => {
+            if (typeof Audio !== 'function' || typeof URL?.createObjectURL !== 'function') {
+                resolve(0);
+                return;
+            }
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio();
+            let timer = 0;
+            let settled = false;
+            const finish = (value) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                audio.onloadedmetadata = null;
+                audio.onerror = null;
+                try { audio.removeAttribute('src'); audio.load(); } catch (_) { }
+                try { URL.revokeObjectURL(url); } catch (_) { }
+                const seconds = Number(value);
+                resolve(Number.isFinite(seconds) && seconds > 0 ? seconds : 0);
+            };
+            timer = setTimeout(() => finish(0), 5000);
+            audio.onloadedmetadata = () => finish(audio.duration);
+            audio.onerror = () => finish(0);
+            audio.preload = 'metadata';
+            audio.src = url;
+        });
+
+        const measureBlobDuration = async (blob) => {
+            try {
+                const bytes = new Uint8Array(await blob.arrayBuffer());
+                const fromHeader = parseWavDuration(bytes);
+                if (fromHeader > 0) return fromHeader;
+            } catch (_) { }
+            return probeBlobDuration(blob);
+        };
+
+        // 缓存命中时沿用上次量好的时长，避免同一段音频每次朗读都再量一遍。
+        const measureBlobDurations = async (blobs, cached) => {
+            if (Array.isArray(cached) && cached.length === blobs.length) return cached;
+            const durations = [];
+            for (let i = 0; i < blobs.length; i++) durations.push(await measureBlobDuration(blobs[i]));
+            return durations;
+        };
+
+        // 播一段音频并把位置回报给进度条。offset = 段内起点（秒），拖动后从这里接着读。
+        const playBlobFrom = (url, token, offset = 0) => new Promise((resolve, reject) => {
             if (token !== playbackToken) {
                 reject(Object.assign(new Error('已取消朗读'), { name: 'AbortError' }));
                 return;
@@ -842,8 +1010,24 @@
             activeAudio = audio;
             const rate = Math.max(0.5, Math.min(2, Number(settings.ttsPlaybackRate) || 1));
             audio.playbackRate = rate;
-            // 部分浏览器在媒体元数据就绪时会把 playbackRate 重置回 1，这里补设一次。
-            audio.onloadedmetadata = () => { audio.playbackRate = rate; };
+            let positioned = false;
+            const position = () => {
+                // 部分浏览器在媒体元数据就绪时会把 playbackRate 重置回 1，这里补设一次。
+                audio.playbackRate = rate;
+                if (positioned) return;
+                positioned = true;
+                const startAt = Number(offset);
+                if (!(startAt > 0)) return;
+                try {
+                    // 留 50ms 余量，避免落点正好在末尾时被判成立即结束。
+                    const limit = Number.isFinite(audio.duration) && audio.duration > 0
+                        ? Math.max(0, audio.duration - 0.05) : startAt;
+                    audio.currentTime = Math.min(startAt, limit);
+                } catch (_) { }
+            };
+            audio.onloadedmetadata = position;
+            // 起播后开始按帧回报进度；什么时候停由暂停/结束/取消自己决定。
+            audio.onplay = () => scheduleTick();
             // 每个播放持有自己的 pending，settle 时比对身份，避免旧播放误结算新播放。
             const pending = {
                 resolve: () => { if (pendingPlayback === pending) pendingPlayback = null; resolve(); },
@@ -858,12 +1042,52 @@
                 if (activeAudio === audio) activeAudio = null;
                 pendingPlayback?.reject(new Error('音频播放失败'));
             };
+            // 元数据已经在缓存里时不会再触发 onloadedmetadata，这里补一次落点。
+            if (audio.readyState >= 1) position();
             const promise = audio.play();
             if (promise?.catch) promise.catch(() => {
                 if (activeAudio === audio) activeAudio = null;
                 pendingPlayback?.reject(new Error('浏览器阻止了自动播放，请再次点击小喇叭'));
             });
         });
+
+        // 拖动进度条：换算成「第几段 + 段内偏移」，打断当前段并从那一点续播。
+        const seekSpeaking = (seconds) => {
+            if (!activeTimeline || !ttsState.seekable) return false;
+            const value = Number(seconds);
+            const target = locateTimelinePosition(activeTimeline, Number.isFinite(value) ? value : 0);
+            pendingSeek = target;
+            ttsState.currentTime = Math.max(0, Math.min(activeTimeline.total,
+                Number.isFinite(value) ? value : 0));
+            // 拖动后要听见声音：之前暂停过就一并恢复。
+            ttsState.paused = false;
+            const audio = activeAudio;
+            if (!audio) return true;
+            // 先摘掉回调再暂停：这一段由播放循环重新起播，不能让 pause/error 把等待结算成失败。
+            audio.onended = null;
+            audio.onerror = null;
+            try { audio.pause(); } catch (_) { }
+            activeAudio = null;
+            cancelTick();
+            settlePlayback(null);
+            return true;
+        };
+
+        // 暂停/继续：只掐住当前段，播放循环仍挂在同一个 await 上，继续时原地接上。
+        const togglePauseSpeaking = () => {
+            const audio = activeAudio;
+            if (!audio || !ttsState.activeKey) return;
+            if (ttsState.paused) {
+                ttsState.paused = false;
+                const promise = audio.play();
+                if (promise?.catch) promise.catch(() => { });
+                scheduleTick();
+                return;
+            }
+            ttsState.paused = true;
+            try { audio.pause(); } catch (_) { }
+            cancelTick();
+        };
 
         const speakMessage = async (index) => {
             const history = getChatHistory() || [];
@@ -942,19 +1166,54 @@
                         trimCache();
                     }
                 }
+                // 进度条：先量出每段时长拼成一条时间轴。整条气泡的总时长到手后，
+                // 进度条才有刻度，拖动也才有落脚点（逐段 blob 已全部在内存里，测量是本地操作）。
+                const durations = await measureBlobDurations(entry.blobs, entry.durations);
+                if (token !== playbackToken) return;
+                if (!Array.isArray(entry.durations)) entry.durations = durations;
+                activeTimeline = buildSpeechTimeline(durations);
+                ttsState.duration = activeTimeline.total;
+                ttsState.currentTime = 0;
+                ttsState.seekable = activeTimeline.total > 0;
+                ttsState.paused = false;
                 ttsState.status = 'playing';
-                for (let i = 0; i < entry.blobs.length; i++) {
+                const blobs = entry.blobs;
+                // 注意：这里的游标不能叫 index —— speakMessage 的参数就叫 index（消息下标），
+                // 在同一作用域里重新声明会把它推进 TDZ，前面的 buildSpeechPlan 会直接抛错。
+                let playIndex = 0;
+                let playOffset = 0;
+                // 合成阶段就拖过进度条时，从拖动落点开始播。
+                if (pendingSeek) {
+                    playIndex = pendingSeek.index;
+                    playOffset = pendingSeek.offset;
+                    pendingSeek = null;
+                }
+                while (playIndex < blobs.length) {
                     if (token !== playbackToken) return;
-                    ttsState.stage = `正在朗读 ${i + 1}/${entry.blobs.length}`;
-                    const url = URL.createObjectURL(entry.blobs[i]);
+                    ttsState.stage = `正在朗读 ${playIndex + 1}/${blobs.length}`;
+                    activeAudioIndex = playIndex;
+                    const url = URL.createObjectURL(blobs[playIndex]);
                     activeObjectUrl = url;
                     try {
-                        await playBlob(url, token);
+                        await playBlobFrom(url, token, playOffset);
                     } finally {
                         if (activeObjectUrl === url) activeObjectUrl = '';
                         URL.revokeObjectURL(url);
                     }
-                    ttsState.done = i + 1;
+                    if (token !== playbackToken) return;
+                    // 这一段被拖动打断：跳到目标段落与段内偏移，而不是顺序播下一段。
+                    if (pendingSeek) {
+                        playIndex = pendingSeek.index;
+                        playOffset = pendingSeek.offset;
+                        pendingSeek = null;
+                        activeAudioIndex = playIndex;
+                        ttsState.done = playIndex;
+                        ttsState.currentTime = activeTimeline.starts[playIndex] || 0;
+                        continue;
+                    }
+                    ttsState.done = playIndex + 1;
+                    playIndex += 1;
+                    playOffset = 0;
                 }
                 if (token === playbackToken) resetTtsState();
             } catch (error) {
@@ -1014,12 +1273,19 @@
                         signal
                     });
                 if (token !== playbackToken) return;
+                // 自检语音同样是「一条音频 = 一条时间轴」，进度上报链路与气泡朗读保持一致。
+                activeTimeline = buildSpeechTimeline([await measureBlobDuration(blob)]);
+                ttsState.duration = activeTimeline.total;
+                ttsState.currentTime = 0;
+                ttsState.seekable = activeTimeline.total > 0;
+                ttsState.paused = false;
                 ttsState.status = 'playing';
                 ttsState.stage = '正在播放测试语音…';
+                activeAudioIndex = 0;
                 const url = URL.createObjectURL(blob);
                 activeObjectUrl = url;
                 try {
-                    await playBlob(url, token);
+                    await playBlobFrom(url, token);
                 } finally {
                     if (activeObjectUrl === url) activeObjectUrl = '';
                     URL.revokeObjectURL(url);
@@ -1051,6 +1317,9 @@
             speakMessage,
             stopSpeaking,
             toggleSpeakMessage,
+            // 进度条：seekSpeaking(秒) 定点续播，togglePauseSpeaking() 暂停/继续。
+            seekSpeaking,
+            togglePauseSpeaking,
             testTtsConnection,
             clearTtsCache
         };
@@ -1069,6 +1338,10 @@
         PRESET_VOICE_OPTIONS,
         TTS_PCM_SAMPLE_RATE,
         MAX_PRESET_CHUNK_LENGTH,
+        // 段数上限与单段长度上限：测试和文档都从这两个常量取值，
+        // 避免「常量改了、别处还写死旧数字」这种假绿。
+        MAX_SEGMENTS,
+        MAX_SEGMENT_LENGTH,
         normalizeTtsMode,
         normalizePresetVoice,
         presetVoiceLabel,
@@ -1078,6 +1351,10 @@
         base64ToBytes,
         concatBytes,
         buildWavBlob,
+        // 朗读进度条：WAV 时长解析 + 逐段时长拼时间轴 + 全局秒数反查段落落点。
+        parseWavDuration,
+        buildSpeechTimeline,
+        locateTimelinePosition,
         readSseAudio,
         UNRESTRICTED_INJECTION,
         buildVoiceDirectorSystemPrompt,

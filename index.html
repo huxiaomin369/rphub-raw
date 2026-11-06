@@ -517,6 +517,30 @@
                                                 :style="settings.fontSize ? { fontSize: settings.fontSize + 'px' } : {}"
                                                 role="alert">{{ msg.responseError }}</div>
                                         </div>
+                                        <!-- 朗读进度条：只在这条气泡正在朗读且有可量时长时出现，可点击/拖动定位到任意位置。 -->
+                                        <div v-if="isSpeakingMessage(msg, index) && ttsState.duration > 0"
+                                            class="tts-player" @click.stop>
+                                            <button type="button" class="tts-player-toggle" @click.stop="togglePauseSpeaking"
+                                                :title="ttsState.paused ? '继续朗读' : '暂停朗读'"
+                                                :aria-label="ttsState.paused ? '继续朗读' : '暂停朗读'">
+                                                <svg v-if="ttsState.paused" class="h-3 w-3" fill="currentColor"
+                                                    viewBox="0 0 24 24" aria-hidden="true">
+                                                    <path d="M8 5v14l11-7z"></path>
+                                                </svg>
+                                                <svg v-else class="h-3 w-3" fill="currentColor" viewBox="0 0 24 24"
+                                                    aria-hidden="true">
+                                                    <path d="M6 5h4v14H6zM14 5h4v14h-4z"></path>
+                                                </svg>
+                                            </button>
+                                            <input type="range" class="tts-player-range" min="0" :max="ttsProgressMax"
+                                                step="0.05" :value="ttsProgressValue"
+                                                :style="{ '--tts-progress': ttsProgressPercent + '%' }"
+                                                aria-label="朗读进度" :aria-valuetext="formatTtsTime(ttsProgressValue)"
+                                                @input="handleTtsScrubInput" @change="handleTtsScrubCommit">
+                                            <span class="tts-player-time">
+                                                {{ formatTtsTime(ttsProgressValue) }} / {{ formatTtsTime(ttsState.duration) }}
+                                            </span>
+                                        </div>
                                     </div>
 
                                     <!-- Message Actions -->

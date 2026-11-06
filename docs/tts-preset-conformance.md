@@ -3,7 +3,13 @@
 > 核对人：spec-verifier（独立验证，不采信实现者自述）
 > 核对时间：2026-11-05（第二轮，P1/P2 修复后复跑）
 > 被核对文件：`assets/js/tts-service.js`，**sha256 前 16 位 `57cf7e6d3e05102a`，1091 行，56038 字节**（本文所有行号均指该版本）
-> 测试结果：`node tests/tts-preset.test.mjs` → **40 例 PASS，0 契约违约，0 反例，退出码 0**
+> 测试结果：`node tests/tts-preset.test.mjs` → **41 例 PASS，0 契约违约，0 反例，退出码 0**
+>
+> ⚠️ **基线已前移，读本文时请注意**：本文是 2026-11-05 的快照（反向参照 1091 行版本），此后有两批改动：
+> 1. commit `7507899`「更新tts最大分段」把 `MAX_SEGMENTS` 40→**50**、`MAX_SEGMENT_LENGTH` 140→**200**；
+> 2. 气泡朗读进度条（`parseWavDuration` / `buildSpeechTimeline` / `locateTimelinePosition`，见 `docs/mimo-tts-api-spec.md` 第 12.5 节）。
+>
+> 因此本文的行号、sha、以及「段数上限 / 单块提示字数」类的数字均已过时；**上限以导出常量为准**（`window.RPHubTts.MAX_SEGMENTS` / `MAX_SEGMENT_LENGTH`），测试也已改为读常量断言，不再写死 40。
 > 官方来源：
 > - 接口字段（权威）：https://mimo.mi.com/docs/zh-CN/api/audio/tts-post
 > - 使用规则（权威）：https://mimo.mi.com/docs/zh-CN/quick-start/usage-guide/audio/speech-synthesis-v2.5
@@ -24,8 +30,8 @@
 | 响应解析（非流式 `message.audio.data` / 流式 `delta.audio.data` / 跳过 `[DONE]` 与空 `choices`） | ✅ 一致 |
 | 错误码映射 | ✅ 400 / 401 / 402 / 403 / 421 / 429 六条各有专门文案，401 与 403 已拆开 |
 | 文本切分 | ✅ 上一轮的 P1-1 / P1-2 / P2-1 三个反例已修复并转为回归护栏 |
-| 截断口径（`truncated`） | ✅ 恰好 40 段 → `false`；41 段 → `true` 且截到 40 |
-| 自动化测试 | 40 例全绿（含 13 个字段级静态锚点、8 个错误码锚点、6 个切分链路锚点） |
+| 截断口径（`truncated`） | ✅ 恰好 `MAX_SEGMENTS` 段 → `false`；`MAX_SEGMENTS + 1` 段 → `true` 且截到 `MAX_SEGMENTS`（当前常量值 50） |
+| 自动化测试 | 41 例全绿（含 13 个字段级静态锚点、8 个错误码锚点、6 个切分链路锚点；段数/单段上限已改为读常量断言） |
 
 ---
 
@@ -141,9 +147,9 @@
 | 项 | 官方 | 实现 | 结论 |
 | --- | --- | --- | --- |
 | 单块长度上限 | **官方未给出合成文本字数上限**（见 `docs/mimo-tts-api-spec.md` 第 10 节 #12；仅知上下文窗口 8K / 最大输出 8K） | `MAX_PRESET_CHUNK_LENGTH = 600`（L20），并有 40 的下限保护（L220） | ✅ 属实现取舍，600 字远低于 8K 上下文，合理 |
-| 段数上限 | 无 | 预置与 voicedesign 都受 `MAX_SEGMENTS = 40`（L13）约束，`buildSpeechPlan` 预置分支 `chunks.slice(0, MAX_SEGMENTS)`（L832）并置 `truncated`（L831） | ✅ 一致口径 |
-| 截断判定 | — | `normalizeVoicePlan` 先记 `truncated = segments.length > MAX_SEGMENTS`（L324）再截断（L325）；`buildSpeechPlan` voicedesign 分支直接用 `plan.truncated === true`（L823） | ✅ 恰好 40 段不会误报（测试已锁） |
-| 截断提示 | — | L911-915：按模式区分文案，preset 提示「只朗读前 40 块（约 24000 字）」，voicedesign 提示「只朗读前 40 段」 | ✅ 合理 |
+| 段数上限 | 无 | 预置与 voicedesign 都受 `MAX_SEGMENTS`（L13，**当前值 50**）约束，`buildSpeechPlan` 预置分支 `chunks.slice(0, MAX_SEGMENTS)` 并置 `truncated` | ✅ 一致口径 |
+| 截断判定 | — | `normalizeVoicePlan` 先记 `truncated = segments.length > MAX_SEGMENTS` 再截断；`buildSpeechPlan` voicedesign 分支直接用 `plan.truncated === true` | ✅ 恰好 `MAX_SEGMENTS` 段不会误报（测试已锁，且读常量断言） |
+| 截断提示 | — | 按模式区分文案，preset 提示「只朗读前 `MAX_SEGMENTS` 块（约 `MAX_SEGMENTS × 600` 字）」，voicedesign 提示「只朗读前 `MAX_SEGMENTS` 段」；文案由常量插值，当前为 50 块 / 约 30000 字 / 50 段 | ✅ 合理 |
 | 切分原则 | — | 先按空行分段（L227），超长段落按句末标点断句（L196，含半角句号），仍超长时 `hardWrapSpeechText` 在末 20% 窗口回退到空白断点（L180-183），断不开才按上限硬切 | ✅ 见第 6 节实测 |
 
 ### 5.1 `hardWrapSpeechText`（L176-189）算法核对
@@ -213,7 +219,7 @@ pieces.push(rest.slice(0, cut).trim()); rest = rest.slice(cut).trimStart();
 | R-1 | **切点处会裁掉 1 个边界空白**（`join('')` 比原文少 N-1 个空白字符，N = 片段数）。实测：400 词丢 5、`. 句` 丢 6、`! 句` 丢 1、中文多段丢 40 | L184-185（`trim()` / `trimStart()`）、L198（`flush()` 的 `trim()`） | 无实害：片段是彼此独立的 TTS 请求，边界空白本来就不产生读音。**非空白字符 100% 逐字守恒**（测试以 `noWs(join('')) === noWs(source)` 断言） |
 | R-2 | CRLF（`\r\n\r\n`）不被 `/\n{2,}/` 命中（L227），分段退化为逐行；短文本片段内残留 `\r` | L219-241 | **真实链路不可达**：上游 `stripForSpeech`（L143）已按 `\n` 拆行并 `trim()`，CRLF 进入切分前已归一化为 LF。实测 CRLF 输入仍满足「非空白不丢字、不超限、无空段」 |
 | R-3 | 正文自身以 `(磁性)` 开头时，`applyStyleTag` 会叠加为 `(温柔)(磁性)正文` | L169-173 | 官方未定义「连续两个括号」的语义；可考虑检测已有标签则不再前置。未判失败 |
-| R-4 | 预置模式也受 `MAX_SEGMENTS = 40` 截断（> 24000 字只读前 40 块） | L831-832、L911-915 | 已有按模式区分的提示文案，可接受 |
+| R-4 | 预置模式也受 `MAX_SEGMENTS` 截断（当前 50 块，> 约 30000 字只读前 50 块） | `buildSpeechPlan` 预置分支、截断提示 toast | 已有按模式区分的提示文案，可接受 |
 
 ---
 

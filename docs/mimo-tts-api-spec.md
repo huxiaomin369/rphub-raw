@@ -767,7 +767,7 @@ curl --location --request POST 'https://api.xiaomimimo.com/v1/chat/completions' 
 
 | 朗读方式 | `settings.ttsMode` | 合成模型 | 是否经过 LLM | 文本切分 |
 | --- | --- | --- | --- | --- |
-| LLM 音色设计（原有能力） | `voicedesign` | `mimo-v2.5-tts-voicedesign` | 是：先由聊天模型输出旁白/对白分镜与音色描述 JSON | 按说话人切分，单段 ≤ 140 字，最多 40 段 |
+| LLM 音色设计（原有能力） | `voicedesign` | `mimo-v2.5-tts-voicedesign` | 是：先由聊天模型输出旁白/对白分镜与音色描述 JSON | 按说话人切分，单段 ≤ `MAX_SEGMENT_LENGTH`（当前 200 字），最多 `MAX_SEGMENTS` 段（当前 50） |
 | 预置音色整段朗读（新增） | `preset` | `mimo-v2.5-tts` | 否 | 不做角色切分，仅按长度切块，单块 ≤ 600 字 |
 
 两种方式共用：小喇叭按钮与播放状态（`ttsState`）、缓存（`MAX_CACHE_ENTRIES = 24`）、播放速度、`AbortController` 取消链路、以及「测试语音合成」自检。
@@ -795,11 +795,30 @@ curl --location --request POST 'https://api.xiaomimimo.com/v1/chat/completions' 
 
 ### 12.4 切块与缓存
 
-- 切块只切不改：优先按空行分段，超长段落再按句末标点断句，仍超长才按 600 字硬切；播放严格按原文顺序。切块结果与 voicedesign 一样受 40 段上限约束，被截断时才会提示「只朗读前 40 段」。
+- 切块只切不改：优先按空行分段，超长段落再按句末标点断句，仍超长才按 600 字硬切；播放严格按原文顺序。切块结果与 voicedesign 一样受 `MAX_SEGMENTS` 上限约束（当前 50 段/50 块），被截断时才会提示「只朗读前 50 段 / 50 块（约 30000 字）」——提示文案由常量插值，不需要跟着改字面。`MAX_SEGMENTS` 与 `MAX_SEGMENT_LENGTH` 都已导出到 `window.RPHubTts`，测试与文档一律读常量，不再写死数字。
 - 缓存键包含「朗读方式 + 合成地址 + 模型 + 音色 + 风格标签 + 指令 + 流式开关 + 消息键 + 文本指纹」（voicedesign 一侧为「合成地址 + 合成模型 + 音色设计模型/地址 + 音色设计上下文 + 附加要求」），因此换音色、换上下文或换模式后都不会命中上一套音频；密钥不参与缓存键。
 - 旧存档没有 `ttsMode` 时回落为 `voicedesign`，即升级后默认行为与升级前一致；`ttsVoice`、`ttsPresetStream` 等新键在加载时也会归一化，避免存档里的 `null` / 字符串污染设置页回显。
 
-### 12.5 已知边界
+### 12.5 朗读进度条（可拖动调节朗读进度）
+
+气泡朗读的音频是**逐段合成**出来的（voicedesign 按说话人分段，preset 按 600 字切块），进度条要的却是**一条连续时间轴**，因此加了一层时间轴映射：
+
+| 环节 | 实现 | 说明 |
+| --- | --- | --- |
+| 时长测量 | `parseWavDuration(bytes)` | 直接读 WAV 头（`fmt` 块的 `byteRate` + `data` 块长度）算秒数，不额外解码；流式链路本地补的就是标准 WAV 头。读不出来时才退到 `<audio>` 元数据探测 |
+| 时间轴 | `buildSpeechTimeline(durations)` | 逐段时长累加成 `{ starts, durations, total }`，`starts[i]` 是第 i 段的全局起点 |
+| 落点换算 | `locateTimelinePosition(timeline, seconds)` | 全局秒数 → `{ index, offset }`（第几段 + 段内偏移）；零时长段不会被选中，越界钳到两端 |
+| 进度上报 | `onTick()`（`requestAnimationFrame`） | 每帧用 `starts[index] + audio.currentTime` 回报位置；暂停/结束即停止排下一帧 |
+| 拖动落点 | `seekSpeaking(seconds)` → `pendingSeek` | 拖动只置目标，播放循环在当前段结束后读到 `pendingSeek` 就跳到「目标段 + 段内偏移」，不重头合成、不重新请求 |
+| 暂停/继续 | `togglePauseSpeaking()` | 只掐当前 `<audio>`，播放循环仍挂在同一个 `await` 上，继续时原地接上 |
+
+- **UI 位置**：进度条贴在气泡底部（`index.html` 的 `.tts-player`），仅在该条气泡正在朗读且总时长 > 0 时出现；左侧暂停/继续，中间可点击/拖动，右侧 `m:ss / m:ss`。
+- **拖动跟手**：拖动过程中只更新本地值（`ttsScrub`），松手（`change`）才真正跳转，避免每移动一像素就打断并重启一次音频。
+- **时长缓存**：量出来的逐段时长回写到缓存条目（`entry.durations`），同一段音频再次朗读时不重复测量。
+- **状态复位**：`stopSpeaking` / 播放结束 / 出错都会清掉 `duration`、`currentTime`、`paused`、`seekable`，不会残留进度条。
+- **回归测试**：`node tests\tts-progress.test.mjs`（17 例：WAV 时长解析、时间轴累加、段边界归属、零时长段跳过、越界钳制、接线与复位）；`node tests\tts-progress-player.test.mjs`（6 例：用假 `<audio>` / 假 `fetch` 跑完整链路——合成→量时长→播放推进→拖动跳段→暂停/继续→播完复位→停读复位）。
+
+### 12.6 已知边界
 
 - 预置音色模式的 `user` 消息指令属于官方「自然语言风格控制」，与 `voicedesign` 的音色描述语义不同：前者只调语气/节奏，不改音色（音色由 `audio.voice` 决定）。
 - 官方未给出合成文本的字数上限（见第 10 节 #12），因此单块长度取 600 字作为经验值，超出即切块。

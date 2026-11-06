@@ -206,8 +206,13 @@ test('[契约] normalizePresetVoice / normalizeTtsMode：空值回落到默认�
   assert.equal(normalizeMode(undefined), 'voicedesign');
 });
 
-test('[契约] normalizeVoicePlan：truncated 与 40 段截断口径一致（恰好 40 → false，41 → true）', () => {
+// 段数/单段长度上限不写死数字：一律从导出常量取值。
+// 历史教训：7507899 把 MAX_SEGMENTS 40→50、MAX_SEGMENT_LENGTH 140→200，只改了实现，
+// 这里仍按 40 断言，套件从此常红（恰好 40 段那条反而还是绿的，更具迷惑性）。
+test('[契约] normalizeVoicePlan：truncated 与 MAX_SEGMENTS 截断口径一致（恰好 N → false，N+1 → true）', () => {
   const normalize = fn('normalizeVoicePlan');
+  const cap = TTS.MAX_SEGMENTS;
+  assert.ok(Number.isInteger(cap) && cap > 0, `MAX_SEGMENTS 必须是正整数，实测 ${cap}`);
   const payload = (count) => ({
     sceneTone: '平静',
     speakers: [{ id: 'narrator', label: '旁白', voiceDesign: '沉稳中性旁白，语速平缓。' }],
@@ -217,12 +222,37 @@ test('[契约] normalizeVoicePlan：truncated 与 40 段截断口径一致（恰
   assert.equal(at5.segments.length, 5);
   assert.equal(at5.truncated, false, '未超上限不应标记 truncated');
   assert.equal(at5.sceneTone, '平静');
-  const at40 = normalize(payload(40), '兜底文本');
-  assert.equal(at40.segments.length, 40);
-  assert.equal(at40.truncated, false, '恰好 40 段不应被判为截断（否则会误报「只朗读前 40 段」）');
-  const at41 = normalize(payload(41), '兜底文本');
-  assert.equal(at41.segments.length, 40, '超过 40 段必须截断到 40');
-  assert.equal(at41.truncated, true, '41 段必须标记 truncated');
+  const atCap = normalize(payload(cap), '兜底文本');
+  assert.equal(atCap.segments.length, cap);
+  assert.equal(atCap.truncated, false, `恰好 ${cap} 段不应被判为截断（否则会误报「只朗读前 ${cap} 段」）`);
+  const overCap = normalize(payload(cap + 1), '兜底文本');
+  assert.equal(overCap.segments.length, cap, `超过 ${cap} 段必须截断到 ${cap}`);
+  assert.equal(overCap.truncated, true, `${cap + 1} 段必须标记 truncated`);
+});
+
+test('[契约] normalizeVoicePlan：单段文本按 MAX_SEGMENT_LENGTH × 4 裁剪（常量驱动）', () => {
+  const normalize = fn('normalizeVoicePlan');
+  const cap = TTS.MAX_SEGMENT_LENGTH;
+  assert.ok(Number.isInteger(cap) && cap > 0, `MAX_SEGMENT_LENGTH 必须是正整数，实测 ${cap}`);
+  const limit = cap * 4;
+  const longText = '甲'.repeat(limit + 200);
+  const result = normalize({
+    sceneTone: '',
+    speakers: [{ id: 'narrator', label: '旁白', voiceDesign: '沉稳中性旁白。' }],
+    segments: [{ speaker: 'narrator', text: longText }]
+  }, '');
+  assert.equal(result.segments.length, 1);
+  const text = result.segments[0].text;
+  // truncate() 截断时会补一个省略号，因此上限是 limit(+1)。
+  assert.ok(text.length <= limit + 1, `单段文本应裁到 ${limit} 以内（含省略号），实测 ${text.length}`);
+  assert.ok(text.endsWith('…'), '超长单段应带省略号，说明确实走了裁剪分支');
+  // 未超限的段落必须逐字保留，不能被顺手裁掉。
+  const short = normalize({
+    sceneTone: '',
+    speakers: [{ id: 'narrator', label: '旁白', voiceDesign: '沉稳中性旁白。' }],
+    segments: [{ speaker: 'narrator', text: '短句。' }]
+  }, '');
+  assert.equal(short.segments[0].text, '短句。');
 });
 
 // ────────────────────────────── 1. splitForPresetSpeech ──────────────────────────────
