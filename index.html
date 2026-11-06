@@ -566,6 +566,10 @@
                                         </button>
                                         <span v-if="isSpeakingMessage(msg, index) && ttsState.stage" class="tts-action-status"
                                             :title="ttsState.stage">{{ ttsState.stage }}</span>
+                                        <span v-if="isSpeakingMessage(msg, index) && ttsState.skipped > 0" class="tts-action-status"
+                                            :title="`${ttsState.skipped} 段合成失败已被跳过；再次点击小喇叭只会重试失败片段`">
+                                            跳过 {{ ttsState.skipped }} 段
+                                        </span>
                                         <button v-if="index === chatHistory.length - 1 && (msg.role === 'user' || chatHistory.slice(0, index).some(m => m.role === 'user'))"
                                             @click="regenerateMessage(index)"
                                             class="message-action-button"

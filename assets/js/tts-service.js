@@ -15,6 +15,14 @@
     const MAX_CONTEXT_MESSAGES = 10;
     const MAX_CACHE_ENTRIES = 24;
     const SYNTHESIS_CONCURRENCY = 3;
+    // 单段合成的失败隔离：每段最多试 3 次（400ms / 800ms 指数退避），
+    // 仍然失败的段降级为「跳过这一段」，不再连坐同一批里的其它段。
+    const SEGMENT_RETRY_ATTEMPTS = 3;
+    const SEGMENT_RETRY_BASE_DELAY_MS = 400;
+    // 段级音频缓存：一条气泡切成 N 段后每段独立落地，失败重试时只重发 miss 的段。
+    const MAX_SEGMENT_CACHE_ENTRIES = 120;
+    // 分镜计划缓存：复用同一份分段结果，否则 LLM 二次切分会让段级缓存整片失效。
+    const MAX_PLAN_CACHE_ENTRIES = 8;
     const CONTEXT_EXCERPT_LENGTH = 220;
     // 预置音色整段朗读：不做角色切分，只按长度上限切块，单块上限放宽到一整段气泡的量级。
     const MAX_PRESET_CHUNK_LENGTH = 600;
@@ -147,6 +155,47 @@
         const text = String(value == null ? '' : value).trim();
         return text.length > length ? text.slice(0, length) + '…' : text;
     };
+
+    // 段级缓存键：整条气泡的缓存键 + 段序号 + 段文本指纹。
+    // 段文本进键是为了让「只重跑 miss 的段」不会把改过的分段串味到别的音频上。
+    const segmentKeyOf = (cacheKey, position, text) => {
+        const body = String(text == null ? '' : text);
+        return `${cacheKey}::#${position}::${body.length}::${body.slice(0, 48)}`;
+    };
+
+    // 一次合成失败值不值得重试：限流、5xx、网络瞬断、超时、空音频可以再试；
+    // 鉴权、参数、内容审核、余额不足这类重试也不会变好，直接落到失败分支。
+    const isRetryableSpeechError = (error) => {
+        if (!error) return false;
+        const name = String(error.name || '');
+        // 用户中止与整条链路的取消不重试，要立刻把控制权交回去。
+        if (name === 'AbortError') return false;
+        if (name === 'TimeoutError') return true;
+        const message = String(error.message || '');
+        if (!message) return false;
+        if (/鉴权|API Key|密钥|余额|额度|不支持|内容审核|内容过滤|content_filter|地域|风控|请求格式|400|401|402|403|421|422/i.test(message)) {
+            return false;
+        }
+        return /429|5\d\d|超时|timeout|timed out|network|fetch|Failed to fetch|ECONN|ETIMEDOUT|EAI_AGAIN|未返回音频|稍后重试/i.test(message);
+    };
+
+    // 可被 signal 打断的等待：拖动进度条或停止朗读要能立刻终止退避，不留在后台空转。
+    const waitForRetry = (ms, signal) => new Promise((resolve, reject) => {
+        const abortError = () => Object.assign(new Error('已取消朗读'), { name: 'AbortError' });
+        if (signal?.aborted) {
+            reject(abortError());
+            return;
+        }
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(abortError());
+        };
+        const timer = setTimeout(() => {
+            try { signal?.removeEventListener?.('abort', onAbort); } catch (_) { }
+            resolve();
+        }, Math.max(0, Number(ms) || 0));
+        try { signal?.addEventListener?.('abort', onAbort, { once: true }); } catch (_) { }
+    });
 
     const normalizeTtsMode = (value) => (String(value == null ? '' : value).trim() === TTS_MODE_PRESET
         ? TTS_MODE_PRESET : TTS_MODE_VOICEDESIGN);
@@ -441,6 +490,26 @@
         return dataSize / byteRate;
     };
 
+    // 段级就绪门闩：合成 worker 每落地一段就打开一个，播放循环只 await 自己那一段。
+    // 有了它，第 0 段合成完就能出声，不必等整条气泡全部合完——首字延迟从
+    // 「最慢那一段」降到「第一段」。
+    const createSegmentGate = () => {
+        let release = () => { };
+        const gate = {
+            promise: new Promise((resolve) => { release = resolve; }),
+            settled: false,
+            value: null,
+            // 只认第一次 settle：成功、失败（null）、被 drain 都走这里，重复调用不会覆盖。
+            settle(value) {
+                if (gate.settled) return;
+                gate.settled = true;
+                gate.value = value || null;
+                release(gate.value);
+            }
+        };
+        return gate;
+    };
+
     // 逐段时长 → 时间轴。无法量出时长的段记 0，不会把整条进度条算歪。
     const buildSpeechTimeline = (durations) => {
         const list = (Array.isArray(durations) ? durations : []).map((value) => {
@@ -610,6 +679,8 @@
             speakerLabels: [],
             total: 0,
             done: 0,
+            // 合成失败被跳过的段数：整条气泡照读，但会把缺口报给界面。
+            skipped: 0,
             fromCache: false,
             // 进度条：duration = 整条气泡的总时长（秒），currentTime = 当前播放位置（秒，全局时间轴）。
             duration: 0,
@@ -620,6 +691,37 @@
         const ttsCacheSize = ref(0);
 
         const audioCache = new Map();
+        // 段级音频缓存与分镜计划缓存：只按「这一段」落地，单段失败不牵连整条气泡。
+        // 键 = 整条气泡缓存键 + 段序号 + 段文本指纹，因此分段变了自然 miss，不会串音。
+        const segmentCache = new Map();
+        const planCache = new Map();
+        // 段级缓存存的是 { blob, seconds }：时长一起留着，命中时就不用再读一遍 WAV 头，
+        // 流式播放要拿它当进度基准，多量一次等于白白给首字加延迟。
+        const rememberSegment = (key, item) => {
+            if (!key || !item?.blob) return;
+            segmentCache.delete(key);
+            segmentCache.set(key, item);
+            while (segmentCache.size > MAX_SEGMENT_CACHE_ENTRIES) {
+                segmentCache.delete(segmentCache.keys().next().value);
+            }
+        };
+        const recallSegment = (key) => {
+            if (!key) return null;
+            const item = segmentCache.get(key);
+            if (!item?.blob) return null;
+            // 命中即刷新热度，淘汰时优先丢最久没用的段。
+            segmentCache.delete(key);
+            segmentCache.set(key, item);
+            return item;
+        };
+        const rememberPlan = (key, plan) => {
+            if (!key || !plan) return;
+            planCache.delete(key);
+            planCache.set(key, plan);
+            while (planCache.size > MAX_PLAN_CACHE_ENTRIES) {
+                planCache.delete(planCache.keys().next().value);
+            }
+        };
         let activeAudio = null;
         let activeObjectUrl = '';
         let activeController = null;
@@ -634,8 +736,13 @@
         };
 
         // 进度条：把逐段音频拼成一条可定位的时间轴，拖动直接在这一层换算成「第几段 + 段内偏移」。
+        // 流式播放期间它是 null：全段就绪后才拼出来，在那之前只有「已播累计秒数」可用。
         let activeTimeline = null;
         let activeAudioIndex = -1;
+        // 当前这段在整条气泡里的起点秒数。流式阶段时间轴还没成形，进度回报只能靠它。
+        let playbackBaseSeconds = 0;
+        // 仍在等合成结果的段门闩：停止/切消息时必须全部打开，否则播放循环会挂在 await 上。
+        let activeGates = [];
         // 拖动/跳转的目标位置。播放循环每段结束后读一次，读到就跳过去。
         let pendingSeek = null;
         let tickHandle = 0;
@@ -651,16 +758,17 @@
         const onTick = () => {
             tickHandle = 0;
             const audio = activeAudio;
-            if (!activeTimeline || !audio || activeAudioIndex < 0) return;
+            if (!audio || activeAudioIndex < 0) return;
             const within = Number.isFinite(audio.currentTime) ? audio.currentTime : 0;
-            const base = activeTimeline.starts[activeAudioIndex] || 0;
-            ttsState.currentTime = Math.max(0, Math.min(activeTimeline.total, base + within));
+            // 基准永远用当前段的起点累加值，时间轴只负责封顶——两条口径不会互相漂移。
+            const position = Math.max(0, playbackBaseSeconds + within);
+            ttsState.currentTime = activeTimeline ? Math.min(activeTimeline.total, position) : position;
             // 暂停/结束后不再排下一帧，进度停在当前位置。
             if (!audio.paused && !audio.ended) scheduleTick();
         };
 
         const scheduleTick = () => {
-            if (tickHandle || !activeTimeline) return;
+            if (tickHandle) return;
             if (typeof requestAnimationFrame === 'function') tickHandle = requestAnimationFrame(onTick);
             else tickHandle = setTimeout(onTick, 120);
         };
@@ -715,6 +823,8 @@
 
         const clearTtsCache = () => {
             audioCache.clear();
+            segmentCache.clear();
+            planCache.clear();
             ttsCacheSize.value = 0;
         };
 
@@ -732,6 +842,7 @@
             cancelTick();
             activeTimeline = null;
             activeAudioIndex = -1;
+            playbackBaseSeconds = 0;
             pendingSeek = null;
             ttsState.activeKey = '';
             ttsState.status = 'idle';
@@ -741,6 +852,7 @@
             ttsState.speakerLabels = [];
             ttsState.total = 0;
             ttsState.done = 0;
+            ttsState.skipped = 0;
             ttsState.fromCache = false;
             ttsState.duration = 0;
             ttsState.currentTime = 0;
@@ -748,9 +860,18 @@
             ttsState.seekable = false;
         };
 
+        // 停止/切消息：把仍在等合成的段门闩全部打开。否则播放循环会一直挂在
+        // `await gate.promise` 上，token 检查永远轮不到执行。
+        const drainSegmentGates = () => {
+            const gates = activeGates;
+            activeGates = [];
+            for (const gate of gates) gate.settle(null);
+        };
+
         const releaseAudio = () => {
             cancelTick();
             activeAudioIndex = -1;
+            drainSegmentGates();
             settlePlayback(Object.assign(new Error('已取消朗读'), { name: 'AbortError' }));
             if (activeAudio) {
                 try {
@@ -936,6 +1057,32 @@
             });
         };
 
+        // 单段合成 + 段内重试。这里刻意不碰 activeController：
+        // 一段 429/超时不该把并发中另外两段正在飞的请求一起 abort 掉。
+        const synthesizeSegmentWithRetry = async ({ segment, signal, token }) => {
+            let lastError = null;
+            for (let attempt = 1; attempt <= SEGMENT_RETRY_ATTEMPTS; attempt++) {
+                if (token !== playbackToken || signal?.aborted) {
+                    throw Object.assign(new Error('已取消朗读'), { name: 'AbortError' });
+                }
+                try {
+                    return await synthesizeSegment({ segment, signal });
+                } catch (error) {
+                    if (error?.name === 'AbortError' || signal?.aborted) throw error;
+                    lastError = error;
+                    // 不可重试的失败直接认输，别把 401 重试三遍。
+                    if (!isRetryableSpeechError(error) || attempt >= SEGMENT_RETRY_ATTEMPTS) break;
+                    const delay = SEGMENT_RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
+                    console.warn(
+                        `[语音朗读] 第 ${attempt} 次合成失败（${segment?.label || '片段'}），`
+                        + `${delay}ms 后只重试这一段：`, error?.message
+                    );
+                    await waitForRetry(delay, signal);
+                }
+            }
+            throw lastError || new Error('语音合成失败');
+        };
+
         // 预置音色模式不经过 LLM：整条气泡文本直接切块，音色固定为设置里的预置音色。
         const buildSpeechPlan = async ({ text, index, signal, mode }) => {
             if (mode !== TTS_MODE_PRESET) {
@@ -993,11 +1140,13 @@
         };
 
         // 缓存命中时沿用上次量好的时长，避免同一段音频每次朗读都再量一遍。
+        // 合成失败的段在 blobs 里是 null：直接记 0 时长，时间轴不会因此塌掉，
+        // locateTimelinePosition 也会天然跳过零时长段。
+        // 必须并行：串行 await 会把 N 段的测量往返全叠在首字之前，长气泡白白多等几秒。
         const measureBlobDurations = async (blobs, cached) => {
-            if (Array.isArray(cached) && cached.length === blobs.length) return cached;
-            const durations = [];
-            for (let i = 0; i < blobs.length; i++) durations.push(await measureBlobDuration(blobs[i]));
-            return durations;
+            const list = Array.isArray(blobs) ? blobs : [];
+            if (Array.isArray(cached) && cached.length === list.length) return cached;
+            return Promise.all(list.map(blob => (blob ? measureBlobDuration(blob) : 0)));
         };
 
         // 播一段音频并把位置回报给进度条。offset = 段内起点（秒），拖动后从这里接着读。
@@ -1120,15 +1269,50 @@
             activeController = new AbortController();
             const signal = activeController.signal;
             try {
-                let entry = audioCache.get(cacheKey);
-                if (entry && settings.ttsCacheEnabled !== false) {
+                const cacheOn = settings.ttsCacheEnabled !== false;
+                let entry = cacheOn ? audioCache.get(cacheKey) : null;
+                // 段级门闩：每段一个，谁先合完谁先开。播放循环按顺序 await 自己那一段，
+                // 因此第 0 段一就绪就能出声，后面几段继续在后台合成，不必等全条齐活。
+                let gates = [];
+                // 合成侧的全部收尾（跳过提示、整条缓存写入、时间轴解锁）都挂在这上面。
+                // 它永远 resolve：播放可能已经跑起来了，不能让收尾动作把播放打断。
+                let synthesisJob = Promise.resolve();
+                // 全段都失败时记下的错误：等播放循环空转完再统一抛，走同一个失败分支。
+                let synthesisError = null;
+                // 全段就绪才拼完整时间轴并解锁拖动。流式阶段 duration 保持 0：
+                // 还没生成的段没有落点，能拖过去也只能空转，不如等齐了再放开。
+                const unlockTimeline = (list) => {
+                    if (token !== playbackToken) return;
+                    activeTimeline = buildSpeechTimeline(list);
+                    ttsState.duration = activeTimeline.total;
+                    ttsState.seekable = activeTimeline.total > 0;
+                };
+                if (entry) {
                     ttsState.fromCache = true;
                     ttsState.speakerLabels = entry.speakerLabels || [];
                     ttsState.total = entry.blobs.length;
+                    // 整条缓存命中：时间轴当场就全了，门闩一次全部打开。
+                    const knownDurations = await measureBlobDurations(entry.blobs, entry.durations);
+                    if (token !== playbackToken) return;
+                    if (!Array.isArray(entry.durations)) entry.durations = knownDurations;
+                    gates = entry.blobs.map((blob, position) => {
+                        const gate = createSegmentGate();
+                        gate.settle(blob ? { blob, seconds: knownDurations[position] || 0 } : null);
+                        return gate;
+                    });
+                    unlockTimeline(knownDurations);
                 } else {
                     ttsState.fromCache = false;
-                    const plan = await buildSpeechPlan({ text, index, signal, mode });
-                    if (token !== playbackToken) return;
+                    // 分镜计划同样复用：LLM 二次切分一旦换了断句，段级缓存会整片 miss，
+                    // 那时重试要付的就不只是失败那几段，而是整条气泡的配额。
+                    let plan = cacheOn ? planCache.get(cacheKey) : null;
+                    if (plan) {
+                        rememberPlan(cacheKey, plan);
+                    } else {
+                        plan = await buildSpeechPlan({ text, index, signal, mode });
+                        if (token !== playbackToken) return;
+                        if (cacheOn) rememberPlan(cacheKey, plan);
+                    }
                     if (!plan.segments.length) {
                         throw new Error(mode === TTS_MODE_PRESET ? '这条消息没有可朗读的文本' : '音色设计未返回可朗读的片段');
                     }
@@ -1141,58 +1325,138 @@
                     ttsState.speakerLabels = [...new Set(plan.segments.map(segment => segment.label))];
                     ttsState.total = plan.segments.length;
                     ttsState.done = 0;
+                    ttsState.skipped = 0;
                     // 分段合成：受 RPM 限制，最多同时跑 3 段，其余排队；播放仍严格按原文顺序。
+                    // 每一段都是独立的失败单元：命中段级缓存就直接复用，失败只重试这一段，
+                    // 彻底失败的段记进 failures 并跳过，不连坐同一批里仍在飞行的其它段。
                     const blobs = new Array(plan.segments.length);
+                    const durations = new Array(plan.segments.length).fill(0);
+                    gates = plan.segments.map(() => createSegmentGate());
                     const queue = plan.segments.map((segment, position) => ({ segment, position }));
                     const concurrency = Math.max(1, Math.min(SYNTHESIS_CONCURRENCY, queue.length));
+                    const failures = [];
                     let synthesized = 0;
+                    let reused = 0;
                     ttsState.status = 'synthesizing';
                     ttsState.stage = `正在合成语音 0/${plan.segments.length}`;
-                    await Promise.all(Array.from({ length: concurrency }, async () => {
+                    const reportProgress = (label) => {
+                        // 播放一旦开跑，这一行文案就归播放循环，两条流水线别抢同一个位置。
+                        if (ttsState.status !== 'synthesizing') return;
+                        ttsState.stage = `正在合成语音 ${synthesized}/${plan.segments.length}｜${label}`;
+                    };
+                    const synthesizeOne = async (item) => {
+                        // 段级缓存键按「气泡 + 段序号 + 段文本」定位，命中就完全不发请求。
+                        const segKey = segmentKeyOf(cacheKey, item.position, item.segment.text);
+                        const cached = cacheOn ? recallSegment(segKey) : null;
+                        if (cached) {
+                            blobs[item.position] = cached.blob;
+                            durations[item.position] = cached.seconds || 0;
+                            gates[item.position].settle({ blob: cached.blob, seconds: cached.seconds || 0 });
+                            reused++;
+                            synthesized++;
+                            reportProgress(item.segment.label);
+                            return;
+                        }
+                        try {
+                            const blob = await synthesizeSegmentWithRetry({ segment: item.segment, signal, token });
+                            // 时长在合成线程里顺手量掉：它既是进度基准也是时间轴来源，
+                            // 放在这里并行算，不占播放路径的时间。
+                            // 量不出来只影响进度刻度，不能让这一段的音频跟着作废。
+                            const seconds = await measureBlobDuration(blob).catch(() => 0);
+                            blobs[item.position] = blob;
+                            durations[item.position] = seconds;
+                            rememberSegment(segKey, { blob, seconds });
+                            gates[item.position].settle({ blob, seconds });
+                            synthesized++;
+                            reportProgress(item.segment.label);
+                        } catch (error) {
+                            // 只有真正的中止才结束整条链路；单段失败降级为「跳过这一段」。
+                            // 门闩无论如何都要开，否则播放循环会一直卡在这一段上。
+                            if (error?.name === 'AbortError' || token !== playbackToken) {
+                                gates[item.position].settle(null);
+                                return;
+                            }
+                            failures.push({ position: item.position, label: item.segment.label, error });
+                            gates[item.position].settle(null);
+                            synthesized++;
+                            reportProgress(`${item.segment.label || '片段'}（失败）`);
+                        }
+                    };
+                    const worker = async () => {
                         while (queue.length) {
                             if (token !== playbackToken) return;
-                            const item = queue.shift();
-                            const blob = await synthesizeSegment({ segment: item.segment, signal });
-                            if (token !== playbackToken) return;
-                            blobs[item.position] = blob;
-                            synthesized++;
-                            ttsState.stage = `正在合成语音 ${synthesized}/${plan.segments.length}｜${item.segment.label}`;
+                            await synthesizeOne(queue.shift());
                         }
-                    }));
-                    if (token !== playbackToken) return;
-                    entry = { blobs, speakerLabels: ttsState.speakerLabels };
-                    if (settings.ttsCacheEnabled !== false) {
-                        audioCache.set(cacheKey, entry);
-                        trimCache();
-                    }
+                    };
+                    synthesisJob = Promise.all(Array.from({ length: concurrency }, worker)).then(() => {
+                        if (token !== playbackToken) return;
+                        // 全段都失败才算这一条气泡失败；只要还有段能播，就按可播内容继续往下读。
+                        if (failures.length && failures.length === plan.segments.length) {
+                            synthesisError = failures[0].error;
+                            return;
+                        }
+                        if (failures.length) {
+                            ttsState.skipped = failures.length;
+                            console.warn('[语音朗读] 部分片段合成失败，已跳过：', failures);
+                            showToast(
+                                `${failures.length} 段合成失败已跳过（${failures.map(f => f.label || '片段').join('、')}），`
+                                + '再次点击小喇叭只重试失败片段', 'warning', 4000
+                            );
+                        } else {
+                            if (reused && cacheOn) {
+                                console.info(`[语音朗读] 段级缓存命中 ${reused} 段，本次只新请求 ${plan.segments.length - reused} 段`);
+                            }
+                            entry = { blobs, durations, speakerLabels: ttsState.speakerLabels };
+                            // 只有整条都成功才写「整条气泡」缓存：带缺口的 entry 一旦写进去，
+                            // 下次点击会直接命中它，失败的那几段就永远等不到重试了。
+                            if (cacheOn) {
+                                audioCache.set(cacheKey, entry);
+                                trimCache();
+                            }
+                        }
+                        // 全段到位，此刻才把逐段时长拼成时间轴并解锁拖动。
+                        unlockTimeline(durations);
+                    }).catch(() => { });
                 }
-                // 进度条：先量出每段时长拼成一条时间轴。整条气泡的总时长到手后，
-                // 进度条才有刻度，拖动也才有落脚点（逐段 blob 已全部在内存里，测量是本地操作）。
-                const durations = await measureBlobDurations(entry.blobs, entry.durations);
-                if (token !== playbackToken) return;
-                if (!Array.isArray(entry.durations)) entry.durations = durations;
-                activeTimeline = buildSpeechTimeline(durations);
-                ttsState.duration = activeTimeline.total;
-                ttsState.currentTime = 0;
-                ttsState.seekable = activeTimeline.total > 0;
+                // 播放：严格按原文顺序，但每段只等自己就绪——第 0 段合成完即出声。
+                // 流式阶段拖动是关着的（seekable=false），所以这里读到的 pendingSeek
+                // 只可能来自「时间轴已就绪」之后的操作。
+                activeGates = gates;
                 ttsState.paused = false;
-                ttsState.status = 'playing';
-                const blobs = entry.blobs;
+                ttsState.currentTime = 0;
                 // 注意：这里的游标不能叫 index —— speakMessage 的参数就叫 index（消息下标），
                 // 在同一作用域里重新声明会把它推进 TDZ，前面的 buildSpeechPlan 会直接抛错。
                 let playIndex = 0;
                 let playOffset = 0;
-                // 合成阶段就拖过进度条时，从拖动落点开始播。
+                // 已播完的段累计时长：流式阶段它就是进度条的基准。
+                let playedSeconds = 0;
+                let playedCount = 0;
                 if (pendingSeek) {
                     playIndex = pendingSeek.index;
                     playOffset = pendingSeek.offset;
                     pendingSeek = null;
                 }
-                while (playIndex < blobs.length) {
+                while (playIndex < gates.length) {
                     if (token !== playbackToken) return;
-                    ttsState.stage = `正在朗读 ${playIndex + 1}/${blobs.length}`;
+                    const gate = gates[playIndex];
+                    // 门闩没开就等这一段；其它段仍在后台并行合成，互不阻塞。
+                    const prepared = await gate.promise;
+                    if (token !== playbackToken) return;
+                    if (!prepared || !prepared.blob) {
+                        // 合成失败的段在时间轴上占 0 秒：跳过，不打断其余段的朗读。
+                        ttsState.done = playIndex + 1;
+                        playIndex += 1;
+                        playOffset = 0;
+                        continue;
+                    }
+                    if (ttsState.status !== 'playing') {
+                        ttsState.status = 'playing';
+                        ttsState.error = '';
+                    }
+                    ttsState.stage = `正在朗读 ${playIndex + 1}/${gates.length}`;
                     activeAudioIndex = playIndex;
-                    const url = URL.createObjectURL(blobs[playIndex]);
+                    playbackBaseSeconds = playedSeconds;
+                    const url = URL.createObjectURL(prepared.blob);
                     activeObjectUrl = url;
                     try {
                         await playBlobFrom(url, token, playOffset);
@@ -1208,17 +1472,27 @@
                         pendingSeek = null;
                         activeAudioIndex = playIndex;
                         ttsState.done = playIndex;
-                        ttsState.currentTime = activeTimeline.starts[playIndex] || 0;
+                        playedSeconds = activeTimeline ? (activeTimeline.starts[playIndex] || 0) : playedSeconds;
+                        playbackBaseSeconds = playedSeconds;
+                        ttsState.currentTime = playedSeconds + playOffset;
                         continue;
                     }
+                    playedCount += 1;
+                    // 基准按「本段起点 + 本段完整时长」推进，从段内中途续播也一样。
+                    playedSeconds = playbackBaseSeconds + (Number(prepared.seconds) || 0);
                     ttsState.done = playIndex + 1;
                     playIndex += 1;
                     playOffset = 0;
                 }
+                // 合成侧可能还在收尾（例如全段失败），等结论落定再决定是否报错。
+                await synthesisJob;
+                if (token !== playbackToken) return;
+                if (!playedCount && synthesisError) throw synthesisError;
                 if (token === playbackToken) resetTtsState();
             } catch (error) {
                 if (token !== playbackToken) return;
-                // 任一段失败就中止其余仍在排队或进行中的合成请求，避免继续消耗配额。
+                // 走到这里说明整条链路真的失败了（音色设计失败，或全部段都合成失败），
+                // 此时才中止仍在飞行中的请求，避免继续消耗配额。
                 try { activeController?.abort(); } catch (_) { }
                 if (error?.name === 'AbortError') return;
                 console.error('语音朗读失败:', error);
@@ -1342,6 +1616,18 @@
         // 避免「常量改了、别处还写死旧数字」这种假绿。
         MAX_SEGMENTS,
         MAX_SEGMENT_LENGTH,
+        // 分段合成失败隔离：单段重试次数、退避基数、段级/计划缓存容量。
+        SYNTHESIS_CONCURRENCY,
+        SEGMENT_RETRY_ATTEMPTS,
+        SEGMENT_RETRY_BASE_DELAY_MS,
+        MAX_SEGMENT_CACHE_ENTRIES,
+        MAX_PLAN_CACHE_ENTRIES,
+        // 段级缓存键与「这次失败值不值得重试」的判定：都是纯函数，测试直接调。
+        segmentKeyOf,
+        isRetryableSpeechError,
+        waitForRetry,
+        // 段级就绪门闩：合成与播放解耦的最小单元，第 0 段就绪即可出声。
+        createSegmentGate,
         normalizeTtsMode,
         normalizePresetVoice,
         presetVoiceLabel,
